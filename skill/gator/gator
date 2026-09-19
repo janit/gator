@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# gator — feed one chunk of work to a bigger model, which chews on it in its own
+# git worktree on its own branch. Verified there, and merged back only when green.
+#
+#   gator feed --title <t> --role <r> --scope <globs> --task <text|@file>
+#   gator status      # what the gator is chewing; finalise anything it has finished
+#   gator wait        # block until it has swallowed everything, then finalise
+#
+# The bare flag forms (--status, --wait, and feed's flags with no verb) still work.
+#
+# The unit runs detached, so it outlives the tool call that started it — the
+# caller is usually a model whose tool calls time out long before the work does.
+#
+# How much it will swallow is enforced here, in code. A model cannot talk its way
+# past a refusal.
+set -uo pipefail
+
+MIN_TASK_CHARS="${GATOR_MIN_TASK_CHARS:-240}"
+MAX_CONCURRENT="${GATOR_MAX_CONCURRENT:-2}"
+MAX_PER_SESSION="${GATOR_MAX_PER_SESSION:-8}"
+COOLDOWN="${GATOR_COOLDOWN:-90}"
+UNIT_TIMEOUT="${GATOR_UNIT_TIMEOUT:-2400}"
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+die(){ echo "refused: $*" >&2; exit 2; }
+log(){ echo "$*" >&2; }
+jget(){ python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],sys.argv[3]))" "$1" "$2" "$3" 2>/dev/null; }
+
+REPO=$(git rev-parse --show-toplevel 2>/dev/null) || die "not a git repository; delegates need worktrees"
+STORE="$REPO/.gator"; mkdir -p "$STORE/worktrees"
+STATE="$STORE/state.json"
+[ -f "$STATE" ] || echo '{"units":0,"last":0,"hashes":[]}' > "$STATE"
+
+# Exclude our store locally. Not through .gitignore: writing a file into the
+# user's repo would later block merging a branch that adds its own .gitignore.
+EXCL="$REPO/.git/info/exclude"
+mkdir -p "$(dirname "$EXCL")"
+grep -qxF '.gator/' "$EXCL" 2>/dev/null || echo '.gator/' >> "$EXCL"
+
+# Roles: a name to a model reference. Environment first, so a session can override
+# a single unit; then the repository's own file; then the user's. Keeping them in a
+# file means no model id lives in the code and no shell profile has to be edited.
+ROLES_FILE="${GATOR_ROLES:-${XDG_CONFIG_HOME:-$HOME/.config}/gator/roles}"
+resolve_role(){
+  local name="$1" var="GATOR_ROLE_$1" line value f
+  [ -n "${!var:-}" ] && { printf '%s' "${!var}"; return; }
+  for f in "$STORE/roles" "$ROLES_FILE"; do
+    [ -f "$f" ] || continue
+    line=$(sed 's/#.*//' "$f" | grep -E "^[[:space:]]*$name[[:space:]]*=" | head -1) || true
+    if [ -n "$line" ]; then
+      value="${line#*=}"
+      # trim surrounding whitespace, then one layer of matching quotes
+      value="${value#"${value%%[![:space:]]*}"}"
+      value="${value%"${value##*[![:space:]]}"}"
+      case "$value" in
+        \"*\") value="${value#\"}"; value="${value%\"}";;
+        \'*\') value="${value#\'}"; value="${value%\'}";;
+      esac
+      printf '%s' "$value"
+      return
+    fi
+  done
+  printf '%s'
+}
+
+# What "green" means here. Explicit config wins; otherwise infer it from the
+# project, and if nothing is recognised, fall back to merge-on-clean and say so.
+detect_verify(){
+  [ -n "${GATOR_VERIFY:-}" ] && { printf '%s' "$GATOR_VERIFY"; return; }
+  [ -f "$STORE/verify" ] && { cat "$STORE/verify"; return; }
+  if [ -f "$REPO/deno.json" ] || [ -f "$REPO/deno.jsonc" ]; then
+    local f="$REPO/deno.json"; [ -f "$f" ] || f="$REPO/deno.jsonc"
+    local cmd=""
+    grep -q '"build"' "$f" && cmd="deno task build"
+    grep -q '"test"' "$f" && cmd="${cmd:+$cmd && }deno task test"
+    [ -n "$cmd" ] || cmd="deno check ."
+    printf '%s' "$cmd"; return
+  fi
+  if [ -f "$REPO/package.json" ]; then
+    grep -q '"test"' "$REPO/package.json" && { printf '%s' "npm test --silent"; return; }
+  fi
+  [ -f "$REPO/Cargo.toml" ] && { printf '%s' "cargo test"; return; }
+  printf '%s' ""
+}
+VERIFY=$(detect_verify)
+
+finalise(){
+  local SLUG="$1" DIR BRANCH WRC VRC ELAPSED BASE AHEAD STATUS EXTRA SUMMARY
+  DIR="$STORE/worktrees/$SLUG"; BRANCH="gator/$SLUG"
+  if [ ! -f "$STORE/$SLUG.done" ]; then
+    echo "UNIT \"$SLUG\" → chewing ($(ls "$DIR" 2>/dev/null | wc -l) files in its worktree so far)"
+    return 0
+  fi
+  WRC=$(jget "$STORE/$SLUG.done" rc 1)
+  VRC=$(jget "$STORE/$SLUG.done" verify_rc -1)
+  ELAPSED=$(jget "$STORE/$SLUG.done" elapsed 0)
+  BASE=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
+  AHEAD=$(git -C "$REPO" rev-list --count "$BASE..$BRANCH" 2>/dev/null || echo 0)
+
+  if   [ "$AHEAD" -eq 0 ]; then STATUS="empty"
+  elif [ "$WRC" -eq 124 ]; then STATUS="timeout"
+  elif [ "$WRC" -ne 0 ];   then STATUS="failed"
+  elif [ "$VRC" -gt 0 ];   then STATUS="unverified"
+  else STATUS="ready"; fi
+
+  EXTRA=""
+  # Hold the merge while the caller's tree is dirty, as the warning at delegation
+  # time promised. Merging into work in progress is not ours to risk.
+  if [ "$STATUS" = "ready" ] && [ -n "$(git -C "$REPO" status --porcelain -- . ':(exclude).gator')" ]; then
+    local GREEN="verification not configured"
+    [ "$VRC" -eq 0 ] && GREEN="verified green"
+    echo "UNIT \"$SLUG\" → ready (held: your working tree has uncommitted changes), $GREEN  [${ELAPSED}s, ${AHEAD} commit(s), branch ${BRANCH}]"
+    echo "Commit or stash your changes, then run 'gator --status' again to merge it."
+    return 0
+  fi
+  if [ "$STATUS" = "ready" ] && [ "${GATOR_AUTOMERGE:-1}" = "1" ]; then
+    if git -C "$REPO" merge --no-edit -q "$BRANCH" 2>/dev/null; then
+      STATUS="merged"; EXTRA=" ($AHEAD commit(s))"
+      [ "$VRC" -eq 0 ] && EXTRA="$EXTRA, verified green"
+      [ "$VRC" -eq -1 ] && EXTRA="$EXTRA, NOT verified (no verify command configured)"
+      git -C "$REPO" worktree remove --force "$DIR" 2>/dev/null
+    else
+      git -C "$REPO" merge --abort 2>/dev/null; STATUS="conflicted"
+    fi
+  fi
+  if [ "$STATUS" = "empty" ]; then
+    git -C "$REPO" worktree remove --force "$DIR" 2>/dev/null
+    git -C "$REPO" branch -D "$BRANCH" -q 2>/dev/null
+  fi
+
+  echo "UNIT \"$SLUG\" → ${STATUS}${EXTRA}  [${ELAPSED}s, ${AHEAD} commit(s), branch ${BRANCH}]"
+  if [ "$STATUS" = "unverified" ]; then
+    echo "NOT merged: the work is committed but the project does not build or test clean."
+    echo "verify command: $VERIFY"
+    echo "--- last 25 lines of its output ---"
+    tail -n 25 "$STORE/$SLUG.verify" 2>/dev/null
+    echo "--- worktree kept at $DIR ---"
+    echo "Delegate a fix unit against this branch, or inspect it yourself. Do not report this as done."
+  else
+    SUMMARY=$(tail -c 400 "$STORE/$SLUG.log" 2>/dev/null | tr '\n' ' ')
+    echo "worker said: ${SUMMARY:- (no output)}"
+  fi
+  mv "$STORE/$SLUG.done" "$STORE/$SLUG.reported" 2>/dev/null
+}
+
+units(){ ls -1 "$STORE"/*.prompt 2>/dev/null | sed 's|.*/||;s|\.prompt$||'; }
+
+TITLE=""; ROLE="heavy"; SCOPE=""; TASK=""; MODE=feed
+# A verb first reads the way the thing works: you feed the gator a chunk of work
+# and it chews on it. The old flag forms still parse, so nothing that already
+# calls this breaks.
+case "${1:-}" in
+  feed)   MODE=feed;   shift ;;
+  status) MODE=status; shift ;;
+  wait)   MODE=wait;   shift ;;
+esac
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --title) TITLE="${2:-}"; shift 2;;
+    --role)  ROLE="${2:-}";  shift 2;;
+    --scope) SCOPE="${2:-}"; shift 2;;
+    --task)  TASK="${2:-}";  shift 2;;
+    --status) MODE=status; shift;;
+    --wait)   MODE=wait;   shift;;
+    *) die "unknown argument: $1";;
+  esac
+done
+
+if [ "$MODE" = "status" ] || [ "$MODE" = "wait" ]; then
+  U=$(units)
+  if [ -z "$U" ]; then
+    echo "the gator has not been fed yet"
+    echo "roles configured:"
+    env | sed -n 's/^GATOR_ROLE_\([A-Za-z0-9_]*\)=\(.*\)/  \1 -> \2  (environment)/p'
+    for f in "$STORE/roles" "$ROLES_FILE"; do
+      [ -f "$f" ] || continue
+      sed 's/#.*//;/^[[:space:]]*$/d' "$f" | sed "s|^[[:space:]]*|  |;s|[[:space:]]*=[[:space:]]*| -> |;s|$|  ($f)|"
+    done
+    echo "verify command: ${VERIFY:-<none detected — chunks will merge on clean, not on green>}"
+    exit 0
+  fi
+  [ "$MODE" = "wait" ] && while ls "$STORE"/*.lock >/dev/null 2>&1; do sleep "${GATOR_POLL:-10}"; done
+  for s in $U; do [ -f "$STORE/$s.reported" ] || finalise "$s"; done
+  exit 0
+fi
+
+case "$TASK" in @*) f="${TASK#@}"; [ -f "$f" ] || die "task file not found: $f"; TASK=$(cat "$f");; esac
+[ -n "$TITLE" ] || die "a chunk needs --title"
+[ -n "$SCOPE" ] || die "\"$TITLE\" names no scope. State which files or globs the chunk touches."
+LEN=${#TASK}
+[ "$LEN" -ge "$MIN_TASK_CHARS" ] || die "\"$TITLE\" is too small a chunk to be worth feeding ($LEN < $MIN_TASK_CHARS chars). Do it yourself."
+MODEL=$(resolve_role "$ROLE")
+[ -n "$MODEL" ] || die "role \"$ROLE\" is not configured. Set GATOR_ROLE_$ROLE, or add
+         \"$ROLE=<provider>/<model>\" to $ROLES_FILE"
+
+HASH=$(printf '%s' "$TASK" | tr '[:upper:]' '[:lower:]' | sha256sum | cut -c1-16)
+UNITS=$(jget "$STATE" units 0); LAST=$(jget "$STATE" last 0)
+python3 -c "
+import json,sys;d=json.load(open('$STATE'));sys.exit(1 if '$HASH' in d.get('hashes',[]) else 0)" \
+  || die "unit \"$TITLE\" has already been fed to the gator this session."
+[ "$UNITS" -lt "$MAX_PER_SESSION" ] || die "feeding budget spent for this session ($UNITS/$MAX_PER_SESSION)."
+NOW=$(date +%s); SINCE=$((NOW-LAST))
+[ "$LAST" -eq 0 ] || [ "$SINCE" -ge "$COOLDOWN" ] || die "still digesting the last one, $((COOLDOWN-SINCE))s remaining."
+INFLIGHT=$(ls -1 "$STORE"/*.lock 2>/dev/null | wc -l)
+[ "$INFLIGHT" -lt "$MAX_CONCURRENT" ] || die "the gator already has its jaws full ($INFLIGHT chewing >= $MAX_CONCURRENT)."
+
+if [ -n "$(git -C "$REPO" status --porcelain -- . ':(exclude).gator')" ]; then
+  log "warning: your working tree has uncommitted changes. The gator eats from committed"
+  log "         HEAD, so it cannot see that work, and nothing will be merged into it."
+fi
+
+SLUG=$(printf '%s' "$TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/-/g;s/^-//;s/-$//' | cut -c1-32)
+DIR="$STORE/worktrees/$SLUG"; BRANCH="gator/$SLUG"
+git -C "$REPO" show-ref --verify --quiet "refs/heads/$BRANCH" && die "branch $BRANCH already exists; rename the unit."
+git -C "$REPO" worktree add -q -b "$BRANCH" "$DIR" HEAD || die "could not create worktree"
+touch "$STORE/$SLUG.lock"
+python3 -c "
+import json;p='$STATE';d=json.load(open(p))
+d['units']=d.get('units',0)+1; d['last']=$NOW; d.setdefault('hashes',[]).append('$HASH')
+json.dump(d,open(p,'w'))"
+
+cat > "$STORE/$SLUG.prompt" <<PROMPT
+You are a delegate working in an isolated git worktree on your own branch. The directory you start
+in is your worktree — treat it as the whole world.
+
+Do the task fully, then COMMIT your work in this worktree. Do not push, do not merge, do not touch
+other branches. If you cannot finish, commit whatever is genuinely useful and say plainly what is
+missing. Do not report success you did not achieve.
+
+Your work is verified before it is merged${VERIFY:+, with: $VERIFY}. Run it yourself before you
+finish; a unit that does not build is not merged, however good it looks.
+
+Files in scope: $SCOPE
+
+TASK:
+$TASK
+PROMPT
+
+CMD="${GATOR_WORKER_CMD:-$(resolve_role worker_cmd)}"
+CMD="${CMD:-pi -p --offline -ne -ns -np -nc --provider %PROVIDER% --model %MODEL% --api-key kek}"
+CMD="${CMD//%PROVIDER%/${MODEL%%/*}}"; CMD="${CMD//%MODEL%/${MODEL#*/}}"
+setsid nohup "$HERE/gator-unit" "$STORE" "$SLUG" "$DIR" "$CMD" "$UNIT_TIMEOUT" "$TITLE" "$VERIFY" >/dev/null 2>&1 &
+disown 2>/dev/null || true
+
+echo "FED \"$TITLE\" → role=$ROLE model=$MODEL branch=$BRANCH"
+echo "verify before merge: ${VERIFY:-<none detected — this chunk will merge on clean, not on green>}"
+echo "The gator is chewing, detached in the background. Check on it with 'gator status',"
+echo "or block until it has swallowed everything with 'gator wait'. Do not feed it the"
+echo "same chunk twice."

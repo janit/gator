@@ -1,0 +1,28 @@
+{
+  "name": "gator",
+  "version": "0.1.0",
+  "license": "MIT",
+  "exports": "./scripts/install.ts",
+  "tasks": {
+    "test": "deno test -A",
+    "install": "deno run -A scripts/install.ts",
+    "check": "deno check scripts/ test/ && deno fmt --check && deno lint"
+  },
+  "imports": {
+    "@std/assert": "jsr:@std/assert@^1"
+  },
+  "fmt": {
+    "include": [
+      "scripts/",
+      "test/"
+    ],
+    "lineWidth": 100,
+    "semiColons": false
+  },
+  "lint": {
+    "include": [
+      "scripts/",
+      "test/"
+    ]
+  }
+}
