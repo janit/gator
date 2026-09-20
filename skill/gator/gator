@@ -28,6 +28,9 @@ jget(){ python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get(sys.a
 
 REPO=$(git rev-parse --show-toplevel 2>/dev/null) || die "not a git repository; delegates need worktrees"
 STORE="$REPO/.gator"; mkdir -p "$STORE/worktrees"
+# The store holds the task text, the worker's output and verifier logs. On a
+# shared host those are another user's to read under a default umask.
+chmod 700 "$STORE" 2>/dev/null || true
 STATE="$STORE/state.json"
 [ -f "$STATE" ] || echo '{"units":0,"last":0,"hashes":[]}' > "$STATE"
 
@@ -41,10 +44,38 @@ grep -qxF '.gator/' "$EXCL" 2>/dev/null || echo '.gator/' >> "$EXCL"
 # a single unit; then the repository's own file; then the user's. Keeping them in a
 # file means no model id lives in the code and no shell profile has to be edited.
 ROLES_FILE="${GATOR_ROLES:-${XDG_CONFIG_HOME:-$HOME/.config}/gator/roles}"
+
+# The repository is untrusted input. `.gator/` lives inside it, and a repository
+# can commit its own — `.git/info/exclude` suppresses only untracked files. A
+# cloned `.gator/roles` supplying `worker_cmd`, or a cloned `.gator/verify`, is
+# arbitrary code that runs the moment anyone uses the gator here. So repository
+# config is ignored unless the user opts in for this invocation.
+trust_repo_config(){ [ "${GATOR_TRUST_REPO_CONFIG:-0}" = "1" ]; }
+warn_untrusted(){
+  local f="$1"
+  [ -f "$f" ] || return 0
+  trust_repo_config && return 0
+  [ -n "${GATOR_WARNED_REPO_CONFIG:-}" ] && return 0
+  export GATOR_WARNED_REPO_CONFIG=1
+  log "note: ignoring repository-supplied $f — it can name the command that runs."
+  log "      Set GATOR_TRUST_REPO_CONFIG=1 if you wrote it and want it used."
+}
+
+# Search order: the environment, then the repository's file, then the user's.
+# The repository's is consulted *only* when trusted — untrusted it is not
+# ranked below the user's, it is not read at all. Trusted, it overrides, which
+# is what a per-repository override is for.
+role_files(){
+  warn_untrusted "$STORE/roles"
+  trust_repo_config && echo "$STORE/roles"
+  echo "$ROLES_FILE"
+  return 0
+}
+
 resolve_role(){
   local name="$1" var="GATOR_ROLE_$1" line value f
   [ -n "${!var:-}" ] && { printf '%s' "${!var}"; return; }
-  for f in "$STORE/roles" "$ROLES_FILE"; do
+  for f in $(role_files); do
     [ -f "$f" ] || continue
     line=$(sed 's/#.*//' "$f" | grep -E "^[[:space:]]*$name[[:space:]]*=" | head -1) || true
     if [ -n "$line" ]; then
@@ -67,7 +98,8 @@ resolve_role(){
 # project, and if nothing is recognised, fall back to merge-on-clean and say so.
 detect_verify(){
   [ -n "${GATOR_VERIFY:-}" ] && { printf '%s' "$GATOR_VERIFY"; return; }
-  [ -f "$STORE/verify" ] && { cat "$STORE/verify"; return; }
+  warn_untrusted "$STORE/verify"
+  if [ -f "$STORE/verify" ] && trust_repo_config; then cat "$STORE/verify"; return; fi
   if [ -f "$REPO/deno.json" ] || [ -f "$REPO/deno.jsonc" ]; then
     local f="$REPO/deno.json"; [ -f "$f" ] || f="$REPO/deno.jsonc"
     local cmd=""
@@ -84,24 +116,63 @@ detect_verify(){
 }
 VERIFY=$(detect_verify)
 
-finalise(){
-  local SLUG="$1" DIR BRANCH WRC VRC ELAPSED BASE AHEAD STATUS EXTRA SUMMARY
-  DIR="$STORE/worktrees/$SLUG"; BRANCH="gator/$SLUG"
-  if [ ! -f "$STORE/$SLUG.done" ]; then
+rget(){ python3 "$HERE/gator-record.py" get "$1" "$2" "$3"; }
+
+# Has the unit reported back? The record answers this, not `.done`: finalising
+# renames `.done` to `.reported`, so a second, purely observational read must
+# not mistake a finished unit for a running one.
+unit_finished(){
+  local REC="$STORE/$1.record.json"
+  if [ -f "$REC" ]; then
+    [ "$(rget "$REC" worker.launch_error true)" = "false" ] && return 0
+    return 1
+  fi
+  # Units fed before records existed: fall back to the old marker files.
+  [ -f "$STORE/$1.done" ] || [ -f "$STORE/$1.reported" ]
+}
+
+# Reporting is a pure read. It prints the unit's status and sets OUTCOME, and
+# it never merges, removes a worktree or marks a unit reported. Automatic units
+# need an observational status (spec section 7); this is that path, built while
+# legacy is still its only caller.
+report_unit(){
+  local SLUG="$1" DIR BRANCH REC AHEAD ELAPSED VCMD
+  DIR="$STORE/worktrees/$SLUG"; BRANCH="gator/$SLUG"; REC="$STORE/$SLUG.record.json"
+  if ! unit_finished "$SLUG"; then
+    OUTCOME="chewing"
     echo "UNIT \"$SLUG\" → chewing ($(ls "$DIR" 2>/dev/null | wc -l) files in its worktree so far)"
     return 0
   fi
-  WRC=$(jget "$STORE/$SLUG.done" rc 1)
-  VRC=$(jget "$STORE/$SLUG.done" verify_rc -1)
-  ELAPSED=$(jget "$STORE/$SLUG.done" elapsed 0)
-  BASE=$(git -C "$REPO" rev-parse --abbrev-ref HEAD)
-  AHEAD=$(git -C "$REPO" rev-list --count "$BASE..$BRANCH" 2>/dev/null || echo 0)
+  OUTCOME=$(python3 "$HERE/gator-record.py" outcome "$REC")
+  AHEAD=$(rget "$REC" result.ahead 0)
+  ELAPSED=$(rget "$REC" worker.elapsed 0)
+  echo "UNIT \"$SLUG\" → ${OUTCOME}  [${ELAPSED}s, ${AHEAD} commit(s), branch ${BRANCH}]"
+  if [ "$OUTCOME" = "unverified" ]; then
+    # The verifier the record holds, never one detected now: they can differ.
+    VCMD=$(rget "$REC" verify.command "")
+    echo "NOT merged: the work is committed but the project does not build or test clean."
+    echo "verify command: $VCMD"
+    echo "--- last 25 lines of its output ---"
+    tail -n 25 "$STORE/$SLUG.verify" 2>/dev/null
+    echo "--- worktree kept at $DIR ---"
+    echo "Delegate a fix unit against this branch, or inspect it yourself. Do not report this as done."
+  fi
+  return 0
+}
 
-  if   [ "$AHEAD" -eq 0 ]; then STATUS="empty"
-  elif [ "$WRC" -eq 124 ]; then STATUS="timeout"
-  elif [ "$WRC" -ne 0 ];   then STATUS="failed"
-  elif [ "$VRC" -gt 0 ];   then STATUS="unverified"
-  else STATUS="ready"; fi
+# Finalising is reporting plus the side effects: the merge, the cleanup and the
+# reported marker.
+finalise(){
+  local SLUG="$1" DIR BRANCH REC VRC AHEAD ELAPSED STATUS EXTRA SUMMARY
+  DIR="$STORE/worktrees/$SLUG"; BRANCH="gator/$SLUG"; REC="$STORE/$SLUG.record.json"
+  if ! unit_finished "$SLUG"; then
+    report_unit "$SLUG"
+    return 0
+  fi
+  STATUS=$(python3 "$HERE/gator-record.py" outcome "$REC")
+  VRC=$(rget "$REC" verify.rc -1)
+  AHEAD=$(rget "$REC" result.ahead 0)
+  ELAPSED=$(rget "$REC" worker.elapsed 0)
 
   EXTRA=""
   # Hold the merge while the caller's tree is dirty, as the warning at delegation
@@ -128,15 +199,10 @@ finalise(){
     git -C "$REPO" branch -D "$BRANCH" -q 2>/dev/null
   fi
 
-  echo "UNIT \"$SLUG\" → ${STATUS}${EXTRA}  [${ELAPSED}s, ${AHEAD} commit(s), branch ${BRANCH}]"
   if [ "$STATUS" = "unverified" ]; then
-    echo "NOT merged: the work is committed but the project does not build or test clean."
-    echo "verify command: $VERIFY"
-    echo "--- last 25 lines of its output ---"
-    tail -n 25 "$STORE/$SLUG.verify" 2>/dev/null
-    echo "--- worktree kept at $DIR ---"
-    echo "Delegate a fix unit against this branch, or inspect it yourself. Do not report this as done."
+    report_unit "$SLUG"
   else
+    echo "UNIT \"$SLUG\" → ${STATUS}${EXTRA}  [${ELAPSED}s, ${AHEAD} commit(s), branch ${BRANCH}]"
     SUMMARY=$(tail -c 400 "$STORE/$SLUG.log" 2>/dev/null | tr '\n' ' ')
     echo "worker said: ${SUMMARY:- (no output)}"
   fi
@@ -145,7 +211,15 @@ finalise(){
 
 units(){ ls -1 "$STORE"/*.prompt 2>/dev/null | sed 's|.*/||;s|\.prompt$||'; }
 
-TITLE=""; ROLE="heavy"; SCOPE=""; TASK=""; MODE=feed
+# `auto` is the controller's, not the legacy parser's. Routing before any flag
+# parsing keeps every auto flag out of this script, and exec hands over the
+# process so the controller owns the exit code directly.
+if [ "${1:-}" = "auto" ]; then
+  shift
+  exec python3 "$HERE/gator-auto.py" --repo "$REPO" --store "$STORE" "$@"
+fi
+
+TITLE=""; ROLE="heavy"; SCOPE=""; TASK=""; MODE=feed; JSON=0; NO_MERGE=0; OUTCOME=""
 # A verb first reads the way the thing works: you feed the gator a chunk of work
 # and it chews on it. The old flag forms still parse, so nothing that already
 # calls this breaks.
@@ -162,6 +236,8 @@ while [ $# -gt 0 ]; do
     --task)  TASK="${2:-}";  shift 2;;
     --status) MODE=status; shift;;
     --wait)   MODE=wait;   shift;;
+    --json)   JSON=1; shift;;
+    --no-merge) NO_MERGE=1; shift;;
     *) die "unknown argument: $1";;
   esac
 done
@@ -169,6 +245,7 @@ done
 if [ "$MODE" = "status" ] || [ "$MODE" = "wait" ]; then
   U=$(units)
   if [ -z "$U" ]; then
+    [ "$JSON" = "1" ] && { python3 "$HERE/gator-record.py" collect "$STORE"; exit 0; }
     echo "the gator has not been fed yet"
     echo "roles configured:"
     env | sed -n 's/^GATOR_ROLE_\([A-Za-z0-9_]*\)=\(.*\)/  \1 -> \2  (environment)/p'
@@ -180,7 +257,14 @@ if [ "$MODE" = "status" ] || [ "$MODE" = "wait" ]; then
     exit 0
   fi
   [ "$MODE" = "wait" ] && while ls "$STORE"/*.lock >/dev/null 2>&1; do sleep "${GATOR_POLL:-10}"; done
-  for s in $U; do [ -f "$STORE/$s.reported" ] || finalise "$s"; done
+  if [ "$JSON" = "1" ]; then
+    python3 "$HERE/gator-record.py" collect "$STORE"
+    exit 0
+  fi
+  for s in $U; do
+    if [ "$NO_MERGE" = "1" ]; then report_unit "$s"
+    else [ -f "$STORE/$s.reported" ] || finalise "$s"; fi
+  done
   exit 0
 fi
 
@@ -192,11 +276,17 @@ LEN=${#TASK}
 MODEL=$(resolve_role "$ROLE")
 [ -n "$MODEL" ] || die "role \"$ROLE\" is not configured. Set GATOR_ROLE_$ROLE, or add
          \"$ROLE=<provider>/<model>\" to $ROLES_FILE"
+# It is interpolated into the worker command, so it is a name, not an expression.
+case "$MODEL" in
+  *[!A-Za-z0-9._/-]*) die "model reference for role \"$ROLE\" contains characters that
+         are not allowed in a name: $MODEL";;
+esac
 
 HASH=$(printf '%s' "$TASK" | tr '[:upper:]' '[:lower:]' | sha256sum | cut -c1-16)
 UNITS=$(jget "$STATE" units 0); LAST=$(jget "$STATE" last 0)
-python3 -c "
-import json,sys;d=json.load(open('$STATE'));sys.exit(1 if '$HASH' in d.get('hashes',[]) else 0)" \
+python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+sys.exit(1 if sys.argv[2] in d.get("hashes",[]) else 0)' "$STATE" "$HASH" \
   || die "unit \"$TITLE\" has already been fed to the gator this session."
 [ "$UNITS" -lt "$MAX_PER_SESSION" ] || die "feeding budget spent for this session ($UNITS/$MAX_PER_SESSION)."
 NOW=$(date +%s); SINCE=$((NOW-LAST))
@@ -214,10 +304,15 @@ DIR="$STORE/worktrees/$SLUG"; BRANCH="gator/$SLUG"
 git -C "$REPO" show-ref --verify --quiet "refs/heads/$BRANCH" && die "branch $BRANCH already exists; rename the unit."
 git -C "$REPO" worktree add -q -b "$BRANCH" "$DIR" HEAD || die "could not create worktree"
 touch "$STORE/$SLUG.lock"
-python3 -c "
-import json;p='$STATE';d=json.load(open(p))
-d['units']=d.get('units',0)+1; d['last']=$NOW; d.setdefault('hashes',[]).append('$HASH')
-json.dump(d,open(p,'w'))"
+# Written through a temporary file and an atomic rename: a crash mid-write must
+# not leave the budget unreadable (spec section 7).
+python3 -c 'import json,os,sys,tempfile
+p,now,h=sys.argv[1],int(sys.argv[2]),sys.argv[3]
+d=json.load(open(p))
+d["units"]=d.get("units",0)+1; d["last"]=now; d.setdefault("hashes",[]).append(h)
+fd,t=tempfile.mkstemp(dir=os.path.dirname(p) or ".")
+with os.fdopen(fd,"w") as f: json.dump(d,f)
+os.replace(t,p)' "$STATE" "$NOW" "$HASH"
 
 cat > "$STORE/$SLUG.prompt" <<PROMPT
 You are a delegate working in an isolated git worktree on your own branch. The directory you start
@@ -239,7 +334,23 @@ PROMPT
 CMD="${GATOR_WORKER_CMD:-$(resolve_role worker_cmd)}"
 CMD="${CMD:-pi -p --offline -ne -ns -np -nc --provider %PROVIDER% --model %MODEL% --api-key kek}"
 CMD="${CMD//%PROVIDER%/${MODEL%%/*}}"; CMD="${CMD//%MODEL%/${MODEL#*/}}"
-setsid nohup "$HERE/gator-unit" "$STORE" "$SLUG" "$DIR" "$CMD" "$UNIT_TIMEOUT" "$TITLE" "$VERIFY" >/dev/null 2>&1 &
+# Launch intent, recorded before the spawn so an interrupted launch is
+# distinguishable from one that never happened (spec section 7). The unit
+# clears worker.launch_error when it reports back.
+BASE_SHA=$(git -C "$REPO" rev-parse HEAD)
+TARGET_REF=$(git -C "$REPO" symbolic-ref -q HEAD || echo "")
+[ -n "$TARGET_REF" ] || die "HEAD is detached; a unit needs a named target branch"
+VERIFY_SHA=$(printf '%s' "$VERIFY" | sha256sum | cut -d' ' -f1)
+RECORD="$STORE/$SLUG.record.json"
+VCONF=false; [ -n "$VERIFY" ] && VCONF=true
+python3 "$HERE/gator-record.py" write "$RECORD" \
+  "slug=$SLUG" "title=$TITLE" "branch=$BRANCH" \
+  "base_sha=$BASE_SHA" "target_ref=$TARGET_REF" \
+  "scope=$SCOPE" "role=$ROLE" "model=$MODEL" \
+  "verify.configured=$VCONF" "verify.command=$VERIFY" "verify.command_sha256=$VERIFY_SHA" \
+  "worker.launch_error=true" "launched_at=$NOW"
+
+setsid nohup "$HERE/gator-unit" "$STORE" "$SLUG" "$DIR" "$CMD" "$UNIT_TIMEOUT" "$TITLE" "$VERIFY" "$RECORD" >/dev/null 2>&1 &
 disown 2>/dev/null || true
 
 echo "FED \"$TITLE\" → role=$ROLE model=$MODEL branch=$BRANCH"

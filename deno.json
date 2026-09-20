@@ -24,5 +24,9 @@
       "scripts/",
       "test/"
     ]
-  }
+  },
+  "exclude": [
+    ".worktrees/",
+    ".gator/"
+  ]
 }

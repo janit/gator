@@ -2,13 +2,52 @@
 // Installs the gator skill into whichever hosts are present. The skill is one
 // SKILL.md plus two scripts, and every host that reads `skills/<name>/SKILL.md`
 // takes it unchanged.
-import { chmodSync, copyFileSync, existsSync, mkdirSync, symlinkSync, unlinkSync } from "node:fs"
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+} from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
 const repoRoot = join(import.meta.dirname!, "..")
 const src = join(repoRoot, "skill", "gator")
-const files = ["SKILL.md", "gator", "gator-unit"]
+
+// The skill is no longer a fixed list of files: the auto controller ships as a
+// package directory beside the scripts. Walk it instead of naming every file,
+// so adding a module does not mean remembering to edit the installer.
+const SKIP = new Set(["__pycache__", ".pytest_cache"])
+
+function walk(dir: string, prefix = ""): string[] {
+  const out: string[] = []
+  for (const entry of readdirSync(dir).sort()) {
+    if (SKIP.has(entry) || entry.endsWith(".pyc")) continue
+    const full = join(dir, entry)
+    const rel = prefix ? `${prefix}/${entry}` : entry
+    if (statSync(full).isDirectory()) out.push(...walk(full, rel))
+    else out.push(rel)
+  }
+  return out
+}
+
+const files = walk(src)
+
+// Entry points the shell invokes directly; everything else is imported.
+const EXECUTABLE = new Set(["gator", "gator-unit", "gator-auto.py", "gator-record.py"])
+
+function install(destDir: string) {
+  for (const name of files) {
+    const dest = join(destDir, name)
+    mkdirSync(join(dest, ".."), { recursive: true })
+    copyFileSync(join(src, name), dest)
+    if (EXECUTABLE.has(name)) chmodSync(dest, 0o755)
+  }
+}
 
 const targets = [
   { host: "OpenCode", dir: join(homedir(), ".config", "opencode", "skill", "gator") },
@@ -26,11 +65,7 @@ for (const { host, dir } of targets) {
     continue
   }
   mkdirSync(dir, { recursive: true })
-  for (const name of files) {
-    const dest = join(dir, name)
-    copyFileSync(join(src, name), dest)
-    if (name.endsWith(".sh")) chmodSync(dest, 0o755)
-  }
+  install(dir)
   console.log(`installed ${host} → ${dir}`)
   installed++
 }
@@ -43,11 +78,7 @@ if (installed === 0) console.error("no supported host config directory found")
 // away. The host skill directories get their own copies for discovery.
 const libDir = join(homedir(), ".local", "share", "gator")
 mkdirSync(libDir, { recursive: true })
-for (const name of files) {
-  const dest = join(libDir, name)
-  copyFileSync(join(src, name), dest)
-  if (name !== "SKILL.md") chmodSync(dest, 0o755)
-}
+install(libDir)
 console.log(`installed ${libDir}`)
 
 const binDir = join(homedir(), ".local", "bin")

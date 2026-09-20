@@ -1,3 +1,6 @@
 node_modules/
 .output/
 .gator/
+.worktrees/
+__pycache__/
+*.pyc

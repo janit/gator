@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# gator-unit <store> <slug> <dir> <cmd> <timeout> <title> [verify]
+# gator-unit <store> <slug> <dir> <cmd> <timeout> <title> [verify] [record]
 #
 # Runs one delegated unit to completion, detached from whoever started it, then
 # commits what the worker produced and — the point of auto-merge-on-green —
 # verifies it *inside the worktree* before anyone merges anything.
 set -uo pipefail
-STORE="$1"; SLUG="$2"; DIR="$3"; CMD="$4"; TMO="$5"; TITLE="$6"; VERIFY="${7:-}"
+STORE="$1"; SLUG="$2"; DIR="$3"; CMD="$4"; TMO="$5"; TITLE="$6"; VERIFY="${7:-}"; RECORD="${8:-}"
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 START=$(date +%s)
+BASE_SHA=$(git -C "$DIR" rev-parse HEAD 2>/dev/null || echo "")
 
 ( cd "$DIR" && timeout "$TMO" bash -c "$CMD" < "$STORE/$SLUG.prompt" ) > "$STORE/$SLUG.log" 2>&1
 WRC=$?
@@ -17,17 +19,37 @@ if [ -n "$(git -C "$DIR" status --porcelain 2>/dev/null)" ]; then
   git -C "$DIR" -c user.email=delegate@local -c user.name=delegate commit -qm "$TITLE" 2>/dev/null
 fi
 
+# Whether anything was committed is a fact about the branch, not about how the
+# commit got there: the worker may have committed on its own.
+COMMIT_SHA=$(git -C "$DIR" rev-parse HEAD 2>/dev/null || echo "")
+AHEAD=$(git -C "$DIR" rev-list --count "$BASE_SHA..HEAD" 2>/dev/null || echo 0)
+COMMITTED=false; [ "$AHEAD" -gt 0 ] 2>/dev/null && COMMITTED=true
+
 # Verification runs in the worktree, never in the caller's tree: a broken unit
-# must cost a merge that never happened, not a rollback of someone's work.
+# must cost a merge that never happened, not a rollback of someone's work. The
+# verified SHA is captured before the run, so the result is bound to the tree
+# that was actually tested (spec section 7).
 VRC=-1
+VERIFIED_SHA=""
 if [ -n "$VERIFY" ]; then
+  VERIFIED_SHA="$COMMIT_SHA"
   ( cd "$DIR" && timeout "${GATOR_VERIFY_TIMEOUT:-900}" bash -c "$VERIFY" ) > "$STORE/$SLUG.verify" 2>&1
   VRC=$?
 fi
 
-python3 - "$STORE/$SLUG.done" "$WRC" "$(( $(date +%s) - START ))" "$VRC" <<'PY'
-import json,sys
-p,rc,el,vrc=sys.argv[1],int(sys.argv[2]),int(sys.argv[3]),int(sys.argv[4])
-json.dump({"rc":rc,"elapsed":el,"verify_rc":vrc},open(p,"w"))
-PY
+ELAPSED=$(( $(date +%s) - START ))
+
+# .done keeps its three original fields: other readers still depend on it.
+python3 -c 'import json,sys
+json.dump({"rc":int(sys.argv[2]),"elapsed":int(sys.argv[3]),"verify_rc":int(sys.argv[4])},
+          open(sys.argv[1],"w"))' "$STORE/$SLUG.done" "$WRC" "$ELAPSED" "$VRC"
+
+if [ -n "$RECORD" ]; then
+  python3 "$HERE/gator-record.py" write "$RECORD" \
+    "worker.launch_error=false" "worker.rc=$WRC" "worker.elapsed=$ELAPSED" \
+    "result.committed=$COMMITTED" "result.commit_sha=$COMMIT_SHA" "result.ahead=$AHEAD" \
+    "verify.rc=$VRC" "verify.verified_sha=$VERIFIED_SHA"
+fi
+# Logs and verifier output carry whatever the worker and the tests printed.
+chmod 600 "$STORE/$SLUG."* 2>/dev/null || true
 rm -f "$STORE/$SLUG.lock"

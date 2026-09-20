@@ -5,9 +5,10 @@ description: Use when a request is substantial work you could describe concretel
 
 # gator 🐊
 
-**Feed the gator.** You are the conversational end of a fleet, and a larger,
-slower model is waiting to be fed. Hand it a chunk of work and it chews on it in
-an isolated git worktree on its own branch, one chunk at a time.
+**Feed the gator.** Short for *delegator*: you are the conversational end of a
+fleet, and a larger, slower model is waiting to be fed. Hand it a chunk of work
+and it chews on it in an isolated git worktree on its own branch, one chunk at
+a time.
 
 ## What is worth feeding it
 
@@ -56,6 +57,40 @@ it the same chunk twice, and do not busy-loop with `sleep`.
 When a chunk comes back `merged`, its work is already on your branch — do not
 copy files out of the worktree yourself.
 
+## Automatic selection
+
+`gator auto plan` reads one **committed** file you name and recommends a single
+unit of work from it. It recommends only — it never starts a worker.
+
+```bash
+gator auto plan --from SPEC.md     # recommend one unit from this source
+gator auto show --plan <plan-id>   # inspect it, and whether it still applies
+gator auto plans                   # what has been planned here
+```
+
+**"No suitable work" is a correct answer, and a successful one.** It exits `0`.
+Report it as the result; do not re-run with a different source hoping for a
+different answer, and do not do the work yourself to make something happen.
+
+A plan is bound to this repository, the branch it was made on, that branch's
+HEAD, the source's committed blob and the selection policy. Change any of them
+and the plan stops applying — `show` says which one. That is the plan doing its
+job, not a bug.
+
+Planning refuses unless a verifier is **approved**, via `GATOR_VERIFY` or — for
+a repository the user has marked as theirs with `GATOR_TRUST_REPO_CONFIG=1` —
+`.gator/verify`. A command merely detected from the project does not count, and
+neither does one a cloned repository brought with it. The verifier also has to
+pass on HEAD before anything is recommended.
+
+Planning is rate limited: a cooldown, a budget and one plan at a time. A
+refusal for `plan_cooldown` or `plan_budget_spent` is not something to retry in
+a loop — each call costs a model request and a full test run.
+
+`gator auto run` does not exist yet. Execution arrives once the safety tests for
+it pass; until then the output of `auto plan` is something for a human to read
+and act on.
+
 ## Verification is part of the contract
 
 A chunk is built and tested **inside its own worktree** before anything is merged.
@@ -84,6 +119,7 @@ Report the status plainly, including the bad ones:
 | `conflicted` | the merge was aborted; the branch is left for inspection |
 | `empty` | **it spat the chunk out — nothing was committed** — never describe this as done |
 | `failed` / `timeout` | the worker errored or ran out of its budget |
+| `no_candidate` | **`auto plan` found nothing eligible** — a success, and the honest answer |
 
 `empty` and `unverified` both matter: a confident summary over work that does not
 exist, or does not build, is the characteristic mid-size-model failure. Reporting

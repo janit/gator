@@ -216,10 +216,36 @@ Deno.test("a role can come from a file instead of the environment", () => {
   ], {
     GATOR_ROLE_heavy: "",
     GATOR_VERIFY: "true",
+    // Repository-supplied config is ignored unless the user opts in: a cloned
+    // .gator/roles can name the command that runs. See test/security_test.ts.
+    GATOR_TRUST_REPO_CONFIG: "1",
   })
   assertEquals(started.code, 0)
   assertStringIncludes(started.out, "model=stub/from-file")
-  waitForUnit(dir, { GATOR_ROLE_heavy: "", GATOR_VERIFY: "true" })
+  waitForUnit(dir, {
+    GATOR_ROLE_heavy: "",
+    GATOR_VERIFY: "true",
+    GATOR_TRUST_REPO_CONFIG: "1",
+  })
+})
+
+Deno.test("COMPAT: a role from the user's own file needs no opt-in", () => {
+  // The behaviour change is scoped to *repository* config. The user's own
+  // roles file works exactly as it always did.
+  const dir = repo("echo hi")
+  const userRoles = join(mkdtempSync(join(tmpdir(), "gator-roles-")), "roles")
+  writeFileSync(userRoles, "heavy = stub/user-file\n")
+  const started = run(dir, [
+    "feed",
+    "--title",
+    "user file role",
+    "--scope",
+    "added.txt",
+    "--task",
+    LONG_TASK,
+  ], { GATOR_ROLE_heavy: "", GATOR_ROLES: userRoles, GATOR_VERIFY: "true" })
+  assertEquals(started.code, 0, started.out)
+  assertStringIncludes(started.out, "model=stub/user-file")
 })
 
 Deno.test("the bare flag form still works, without the verb", () => {

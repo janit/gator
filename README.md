@@ -1,13 +1,15 @@
 # gator 🐊
 
-**gator** is a skill for feeding a larger model. A chat model
-hands it a chunk of substantial work; the gator chews on it in an isolated git
-worktree on its own branch, and it is merged back only when it builds and tests
-clean.
+**gator** is a **dele*gator*** skill — the name is the end of the word, and the
+animal earns it. A chat model hands it a chunk of substantial work; the gator
+chews on it in an isolated git worktree on its own branch, and it is merged back
+only when it builds and tests clean.
 
-One `SKILL.md` and two shell scripts. No plugin, no host API. Any agent that
-reads `skills/<name>/SKILL.md` and can run a shell command can use it: OpenCode,
-Pi, Claude Code.
+Delegation, in other words, with teeth: what comes back has to build.
+
+One `SKILL.md`, two shell scripts and a small Python controller. No plugin, no
+host API. Any agent that reads `skills/<name>/SKILL.md` and can run a shell
+command can use it: OpenCode, Pi, Claude Code.
 
 ```bash
 deno task install     # installs the skill, and `gator` onto your PATH
@@ -107,6 +109,72 @@ reason.
 
 The gator chews detached, so a chunk outlives the tool call that fed it and
 survives the session being interrupted.
+
+## Automatic selection
+
+`gator auto plan` picks one unit of work out of a committed file and recommends
+it. It recommends only — no worker starts.
+
+```bash
+gator auto plan  --from SPEC.md     # recommend one unit
+gator auto show  --plan <plan-id>   # inspect it, and whether it still applies
+gator auto plans                    # what has been planned here
+```
+
+The result is a canonical, hashed manifest under `.gator/auto/plans/`, bound to
+this checkout, the branch, its HEAD, the source's committed blob and the
+selection policy. Change any of them and the plan stops applying, and `show`
+names which. "No suitable work" is a normal, successful answer.
+
+Planning refuses without a verifier you approved — `GATOR_VERIFY` or
+`.gator/verify`. A command detected from the project is the tool guessing, not
+your approval, and auto will not guess. The verifier must also pass on HEAD
+before anything is recommended.
+
+Planning is rate limited the way `feed` is — a cooldown, a per-repository
+budget and one plan at a time — because each call costs a model request and a
+full verifier run. `GATOR_PLAN_COOLDOWN`, `GATOR_MAX_PLANS`.
+
+`gator auto run` does not exist yet. See [docs/auto.md](docs/auto.md).
+
+## Supported platform
+
+Linux, with the GNU utilities this already assumes — `timeout`, `setsid`,
+`readlink -f`, `sha256sum` — plus Git and Python 3. Deno builds and tests it but
+is not needed to run it. Other platforms may work and have not been tested.
+
+## Security model
+
+Be clear about what this does and does not do.
+
+**It protects integration.** Work happens in a separate worktree on its own
+branch, it is verified there, and nothing reaches your branch unless the
+verifier passed. A bad unit costs a merge that never happened.
+
+**It is not a sandbox.** The worker and the planner are subprocesses running
+with your permissions. Nothing here prevents writes outside the worktree,
+network access, reading credentials or manipulating git. The prompt asks the
+worker not to push; asking is all it is. If you point this at a model you do not
+trust, the worktree will not save you — that needs real isolation, which is
+separate future work and is not claimed here.
+
+The planner is given no tools at all (`-nt`), which is a capability restriction
+rather than a request, and the source it reads is fenced as untrusted data with
+no authority over budgets, commands or policy. That bounds the planner. It does
+not bound the worker.
+
+**The repository is untrusted input.** `.gator/` lives inside it and a
+repository can commit its own, so a clone can arrive carrying a `roles` file
+that names the command to run, or a `verify` file that the baseline check would
+execute. Both are ignored unless you say otherwise:
+
+```bash
+GATOR_TRUST_REPO_CONFIG=1 gator ...   # this repository's .gator/ is mine
+```
+
+Without it, a repository-supplied `roles` or `verify` is skipped with a note on
+stderr, and `auto plan` refuses for want of an approved verifier rather than
+running a stranger's shell. Set it only for repositories you wrote.
 
 ## Tests
 
