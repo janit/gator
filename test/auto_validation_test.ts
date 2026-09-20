@@ -9,8 +9,13 @@ sys.path.insert(0, ${JSON.stringify(PY)})
 from gator_auto.plan import validate_candidates
 from gator_auto.repo import Refusal
 try:
-    out = validate_candidates(json.loads(sys.argv[1]), {})
-    print(json.dumps({"ok": True, "n": len(out)}))
+    out, unusable = validate_candidates(json.loads(sys.argv[1]), {})
+    # A per-candidate failure is reported, not raised: surface the first one
+    # so this matrix still asserts on a single reason code.
+    if unusable:
+        print(json.dumps({"ok": False, "code": unusable[0]["reason"]}))
+    else:
+        print(json.dumps({"ok": True, "n": len(out)}))
 except Refusal as r:
     print(json.dumps({"ok": False, "code": r.code}))
 except Exception as e:
@@ -106,8 +111,11 @@ Deno.test("§9.4: more than 20 candidates fails closed", () => {
   assertEquals(validate(JSON.stringify(many)).code, "too_many_candidates")
 })
 
-Deno.test("§9.4: a dependency on an unknown candidate fails closed", () => {
-  assertEquals(validate(mutate((c) => c.depends_on = ["ghost"])).code, "unknown_dependency")
+Deno.test("§9.4: a dependency on an unknown candidate makes it ineligible", () => {
+  // Validation accepts the shape; the rubric is what refuses to select it.
+  // Reported per candidate rather than rejecting the whole plan — see
+  // test/auto_rank_test.ts for the eligibility side.
+  assertEquals(validate(mutate((c) => c.depends_on = ["ghost"])).ok, true)
 })
 
 Deno.test("§9.4: a non-object top level fails closed", () => {

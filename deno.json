@@ -27,6 +27,8 @@
   },
   "exclude": [
     ".worktrees/",
+    ".claude/",
+    ".serena/",
     ".gator/"
   ]
 }

@@ -4,3 +4,5 @@ node_modules/
 .worktrees/
 __pycache__/
 *.pyc
+.claude/
+.serena/

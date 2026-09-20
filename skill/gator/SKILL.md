@@ -72,6 +72,13 @@ gator auto plans                   # what has been planned here
 Report it as the result; do not re-run with a different source hoping for a
 different answer, and do not do the work yourself to make something happen.
 
+There are two such answers and they mean different things. `none_eligible`
+means items were considered and each was turned down — the plan lists them with
+reasons, and those reasons are the useful part to report. `no_items` means the
+planner found nothing at all in the source, which is right only if the source
+really is empty; otherwise say so plainly, because it points at a planner
+failure rather than a clean backlog.
+
 A plan is bound to this repository, the branch it was made on, that branch's
 HEAD, the source's committed blob and the selection policy. Change any of them
 and the plan stops applying — `show` says which one. That is the plan doing its

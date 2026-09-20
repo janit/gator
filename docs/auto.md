@@ -20,6 +20,19 @@ or policy refusal; `3` a terminal unsuccessful run; `4` a wait deadline while
 work is still active. JSON is the machine contract — never parse the human
 output.
 
+## Outcomes
+
+`plan` answers one of three ways, and they are not interchangeable:
+
+| `outcome` | meaning |
+|---|---|
+| `selected` | one unit chosen; `selected_id` names it |
+| `none_eligible` | items were considered and every one turned down — `considered` says how many |
+| `no_items` | the planner reported no work items at all |
+
+`no_items` is correct only if the source really contains none. Otherwise it is
+a planner failure, and the response that caused it is on disk.
+
 ## What gets stored
 
 ```
@@ -27,6 +40,8 @@ output.
   auto/
     plans/<plan-id>.json      canonical bytes; `sha256sum` reproduces the digest
     plans/<plan-id>.sha256    the digest, sha256sum-compatible
+    plans/<plan-id>.raw.txt   the response that produced this plan
+    last-response.txt         the last thing the planner said, whatever happened
     completed.json            the dedup ledger
 ```
 
@@ -46,6 +61,29 @@ A plan binds to five things. Any drift and it no longer applies:
 
 Checked most-specific-first: committing a source edit also moves HEAD, so both
 are true, and `stale_source` is the one worth telling you about.
+
+## Evidence
+
+The planner's raw response is always kept. `last-response.txt` is written
+before validation, so a response that *fails* to validate is still readable —
+that is the one worth reading. A response that produced a plan is also filed
+under the plan's own id.
+
+This is not a nicety. The first real-model run of this tool could not be
+diagnosed at all, because the only record of what the model said was thrown
+away the instant it was parsed.
+
+## Validation is per candidate
+
+A candidate that fails the contract is reported with its reason and **excluded
+from selection**; it does not refuse the whole plan. The planner is asked to
+rate every item a source contains, which means being sent items that cannot be
+built — an undesigned task names no files, so its scope is empty — and one of
+those must not destroy a plan that judged the rest correctly.
+
+Nothing unvalidated can be selected, which is the property that matters. A
+malformed *response* — not JSON, no `candidates` list, over the candidate
+ceiling — still refuses wholesale.
 
 ## The rubric
 

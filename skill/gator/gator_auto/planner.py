@@ -32,8 +32,14 @@ PLANNER_DEFAULT = (
 # Either spelling of the flag that makes the restriction real.
 TOOLLESS = ("-nt", "--no-tools")
 
-PROMPT = """You are selecting one unit of work to delegate. You have no tools; \
+PROMPT = """You are rating candidate units of work. You have no tools; \
 everything you need is below.
+
+**Rate every item the source contains. Do not pre-select a winner** — the \
+choice is made from your ratings by code you are not part of, using fixed \
+thresholds. An item you leave out is not considered at all, and an item you \
+rate honestly as poor is still useful: its rating is how the person reading \
+this learns why it was passed over. Omitting the weak items throws that away.
 
 Return ONE JSON object and nothing else:
 
@@ -62,9 +68,13 @@ Ratings:
 
 Only clarity 2 and boundedness 2 are selectable, so do not round up. If the \
 source does not state a concrete outcome and testable criteria, rate it \
-honestly and let it be deferred. Returning {"candidates": []} is a correct \
-answer when nothing qualifies. Do not invent requirements the source does not \
+honestly and let the thresholds defer it — that is the system working, not a \
+failure to find something. Do not invent requirements the source does not \
 contain, and do not expand a bounded change into a project.
+
+Return `{"candidates": []}` only when the source genuinely contains no work \
+items at all. If it contains items and none are any good, return them rated \
+poorly. Those are different answers and are reported differently.
 
 Scope patterns are exact repository-relative paths or `<dir>/**`. A \
 whole-repository scope is not a scope.

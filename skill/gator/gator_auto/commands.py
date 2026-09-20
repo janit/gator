@@ -6,6 +6,8 @@ import sys
 from . import SCHEMA_VERSION
 from . import budget
 from .plan import (
+    archive_response,
+    keep_response,
     check_binding,
     listing,
     load,
@@ -104,12 +106,26 @@ def plan(opts):
         timeout = int(env.get("GATOR_PLANNER_TIMEOUT", PLANNER_TIMEOUT))
 
         budget.record(opts["store"], env)
-        raw = extract_json(invoke(cmd, prompt, timeout))
+        # Keep the response before anything can reject it. When a plan cannot
+        # be built there is no plan to file the evidence under, and that is
+        # precisely when it is needed: the 2026-09-20 pilot had to reproduce a
+        # run by hand to find out whether the model or the validator had failed.
+        response = invoke(cmd, prompt, timeout)
+        keep_response(opts["store"], response)
+        raw = extract_json(response)
 
-    candidates = mark_completed(
-        validate_candidates(raw, {}), opts["store"], source["blob_sha"]
-    )
+    validated, unusable = validate_candidates(raw, {})
+    candidates = mark_completed(validated, opts["store"], source["blob_sha"])
     chosen = select(candidates, {})
+    # Candidates the contract could not accept are reported alongside the ones
+    # the rubric turned down. They were considered; they just cannot be acted
+    # on, and silently dropping them would misreport what the planner said.
+    chosen["rejected"].extend({
+        "id": u["id"] or "(unnamed)",
+        "title": "(unusable)",
+        "reason": u["reason"],
+        "rationale": u["detail"],
+    } for u in unusable)
 
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -123,8 +139,19 @@ def plan(opts):
         "selected_id": chosen["selected_id"],
         "candidates": chosen["candidates"],
         "rejected": chosen["rejected"],
+        # Three answers, not two. "The planner found no items" and "items were
+        # found and none qualified" both used to print "No suitable work",
+        # which made a planner malfunction indistinguishable from a correct
+        # abstention — the failure mode the 2026-09-20 pilot could not see.
+        "outcome": (
+            "selected" if chosen["selected_id"]
+            else "none_eligible" if (chosen["candidates"] or chosen["rejected"])
+            else "no_items"
+        ),
+        "considered": len(chosen["candidates"]) + len(chosen["rejected"]),
     }
     save(opts["store"], result)
+    archive_response(opts["store"], result["plan_id"], response)
     if opts["json"]:
         return emit(result, True)
     render(result)
@@ -133,8 +160,17 @@ def plan(opts):
 
 def render(result):
     selected = result["selected_id"]
+    if result.get("outcome") == "no_items":
+        print("The planner reported no work items at all in this source.")
+        print(
+            "That is the right answer only if the source really contains none. "
+            "Otherwise it is a planner failure — read what it actually said:"
+        )
+        print("  .gator/auto/last-response.txt")
+        return
     if selected is None:
-        print("No suitable work in this source. That is a result, not a failure.")
+        n = result.get("considered", 0)
+        print(f"Considered {n} item(s); none eligible. That is a result, not a failure.")
     else:
         chosen = next(c for c in result["candidates"] if c["id"] == selected)
         print(f'SELECTED "{chosen["id"]}" — {chosen["title"]}')

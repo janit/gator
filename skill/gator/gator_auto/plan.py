@@ -82,7 +82,28 @@ def validate_candidates(raw, limits):
 
     seen = set()
     out = []
+    unusable = []
     for candidate in candidates:
+        try:
+            out.append(_validate_one(candidate, seen))
+        except Refusal as bad:
+            # One unusable candidate must not destroy a plan that judged the
+            # rest correctly. Asking the planner to rate *every* item means
+            # being sent items that cannot be built — an undesigned task
+            # naming no files, say — and for a command that only recommends,
+            # the safe answer is to drop that one and say why, not to refuse
+            # the whole answer. Dropped candidates can never be selected, so
+            # nothing unvalidated reaches a worker.
+            unusable.append({
+                "id": candidate.get("id") if isinstance(candidate, dict) else None,
+                "reason": bad.code,
+                "detail": bad.message,
+            })
+    return out, unusable
+
+
+def _validate_one(candidate, seen):
+    for candidate in (candidate,):
         if not isinstance(candidate, dict):
             raise Refusal("planner_invalid_json", "each candidate must be a JSON object")
 
@@ -103,7 +124,6 @@ def validate_candidates(raw, limits):
             raise Refusal("candidate_bad_id", f"candidate id is not a safe slug: {cid!r}")
         if cid in seen:
             raise Refusal("candidate_duplicate_id", f"two candidates share the id {cid!r}")
-        seen.add(cid)
 
         for key, (low, high) in SCORE_RANGE.items():
             value = candidate[key]
@@ -158,17 +178,8 @@ def validate_candidates(raw, limits):
 
         normalised = dict(candidate)
         normalised["scope"] = validate_scope(candidate["scope"])
-        out.append(normalised)
-
-    known = {c["id"] for c in out}
-    for candidate in out:
-        for dep in candidate["depends_on"]:
-            if dep not in known:
-                raise Refusal(
-                    "unknown_dependency",
-                    f"{candidate['id']} depends on {dep!r}, which is not a candidate",
-                )
-    return out
+        seen.add(cid)
+        return normalised
 
 
 # --------------------------------------------------------------- persistence
@@ -345,3 +356,30 @@ def mark_completed(candidates, store, source_blob_sha):
             "same_revision": entry.get("source_blob_sha") == source_blob_sha,
         }
     return candidates
+
+
+# ------------------------------------------------------------- raw responses
+
+def _write_private(path, text):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, temp = tempfile.mkstemp(dir=directory)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+    os.chmod(temp, 0o600)
+    os.replace(temp, path)
+
+
+def keep_response(store, text):
+    """The last thing the planner said, whatever happened next.
+
+    Written before validation, because a response that fails to validate is the
+    one worth reading. It can quote the source, so it is 0600 like the rest of
+    the store.
+    """
+    _write_private(os.path.join(store, "auto", "last-response.txt"), text)
+
+
+def archive_response(store, plan_id, text):
+    """The response that produced this plan, filed under the plan's own id."""
+    _write_private(os.path.join(plans_dir(store), f"{plan_id}.raw.txt"), text)

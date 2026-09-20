@@ -80,15 +80,30 @@ Deno.test("§9.2: an empty candidate list is a successful no-candidate plan", ()
   assertEquals(JSON.parse(r.out).selected_id, null)
 })
 
-Deno.test("§9.2: the human rendering says plainly that nothing qualified", () => {
+Deno.test("§9.2: the human rendering distinguishes the two empty answers", () => {
+  // A planner that found nothing and a planner whose every item was rejected
+  // used to print the same line. See test/auto_evidence_test.ts.
   const dir = specRepo()
-  const r = run(dir, ["auto", "plan", "--from", "SPEC.md"], {
+  const nothing = run(dir, ["auto", "plan", "--from", "SPEC.md"], {
     GATOR_PLANNER_CMD: stubPlanner(emits('{"candidates": []}')),
     GATOR_VERIFY: "true",
+    GATOR_PLAN_COOLDOWN: "0",
   })
-  assertEquals(r.code, 0, r.out)
-  assertStringIncludes(r.out, "No suitable work")
-  assertStringIncludes(r.out, "not a failure")
+  assertEquals(nothing.code, 0, nothing.out)
+  assertStringIncludes(nothing.out, "no work items at all")
+
+  const rejected = run(dir, ["auto", "plan", "--from", "SPEC.md"], {
+    GATOR_PLANNER_CMD: stubPlanner(
+      emits(JSON.stringify({
+        candidates: [{ ...JSON.parse(CANDIDATE).candidates[0], clarity: 0 }],
+      })),
+    ),
+    GATOR_VERIFY: "true",
+    GATOR_PLAN_COOLDOWN: "0",
+  })
+  assertEquals(rejected.code, 0, rejected.out)
+  assertStringIncludes(rejected.out, "none eligible")
+  assertStringIncludes(rejected.out, "not a failure")
 })
 
 Deno.test("§9.4: a planner that times out fails closed", () => {
@@ -338,8 +353,12 @@ Deno.test("§6: the planner cannot set previously_completed itself", () => {
     candidates: [{ ...JSON.parse(CANDIDATE).candidates[0], previously_completed: null }],
   })
   const r = planWith(specRepo(), stubPlanner(emits(forged)))
-  assertEquals(r.code, 2)
-  assertStringIncludes(r.out, "candidate_unknown_field")
+  assertEquals(r.code, 0, r.out)
+  const p = JSON.parse(r.out)
+  // Rejected rather than refusing the whole plan, and — the point — never
+  // selected, so a planner-set field can reach nothing.
+  assertEquals(p.selected_id, null)
+  assertEquals(p.rejected[0].reason, "candidate_unknown_field")
 })
 
 // ----------------------------------------- §9.6 the verification gate
