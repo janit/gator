@@ -50,8 +50,14 @@ def effective_policy(env):
 
 
 def resolve_role(env, name):
-    var = f"GATOR_ROLE_{name}"
-    return env.get(var, "")
+    """Read a role `gator` already resolved.
+
+    Precedence — environment, then the repository's roles file when trusted,
+    then the user's — is implemented once, in the shell script, which exports
+    the answer before handing over. Re-deriving it here would be a second
+    implementation of a subtle rule, and the two would drift.
+    """
+    return env.get(f"GATOR_ROLE_{name}", "")
 
 
 def plan(opts):

@@ -95,9 +95,21 @@ def resolve_planner_cmd(env, model):
                 f"the planner command does not disable tools: {cmd}. "
                 "Add -nt (or --no-tools). A read-only prompt is not a capability restriction.",
             )
-    if model:
-        cmd = cmd.replace("%PROVIDER%", model.split("/", 1)[0])
-        cmd = cmd.replace("%MODEL%", model.split("/", 1)[-1])
+    # A command carrying placeholders with no model to fill them would reach
+    # the host as the literal "%PROVIDER%", which surfaces as the host's own
+    # confusing error. Refuse here and say what is actually missing.
+    if not model:
+        if "%PROVIDER%" in cmd or "%MODEL%" in cmd:
+            raise Refusal(
+                "planner_role_not_configured",
+                "no planner model. Set GATOR_ROLE_planner, or add "
+                '"planner = <provider>/<model>" to your roles file '
+                "(~/.config/gator/roles). The heavy role is used as a fallback.",
+            )
+        return cmd
+
+    cmd = cmd.replace("%PROVIDER%", model.split("/", 1)[0])
+    cmd = cmd.replace("%MODEL%", model.split("/", 1)[-1])
     return cmd
 
 

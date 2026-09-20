@@ -94,6 +94,15 @@ resolve_role(){
   printf '%s'
 }
 
+# A model reference is substituted into a command string, so it is a name and
+# not an expression. Both `feed` and `auto` route their model through here.
+check_model(){
+  case "$1" in
+    *[!A-Za-z0-9._/-]*) die "model reference for role \"$2\" contains characters that
+         are not allowed in a name: $1";;
+  esac
+}
+
 # What "green" means here. Explicit config wins; otherwise infer it from the
 # project, and if nothing is recognised, fall back to merge-on-clean and say so.
 detect_verify(){
@@ -216,6 +225,18 @@ units(){ ls -1 "$STORE"/*.prompt 2>/dev/null | sed 's|.*/||;s|\.prompt$||'; }
 # process so the controller owns the exit code directly.
 if [ "${1:-}" = "auto" ]; then
   shift
+  # Resolve roles here rather than in the controller. Precedence — environment,
+  # then the repository's file when trusted, then the user's — is subtle enough
+  # that a second implementation of it in Python would drift. The controller
+  # receives answers, not rules.
+  for r in planner heavy; do
+    v=$(resolve_role "$r")
+    [ -n "$v" ] && { check_model "$v" "$r"; export "GATOR_ROLE_$r=$v"; }
+  done
+  if [ -z "${GATOR_PLANNER_CMD:-}" ]; then
+    pc=$(resolve_role planner_cmd)
+    [ -n "$pc" ] && export GATOR_PLANNER_CMD="$pc"
+  fi
   exec python3 "$HERE/gator-auto.py" --repo "$REPO" --store "$STORE" "$@"
 fi
 
@@ -276,11 +297,7 @@ LEN=${#TASK}
 MODEL=$(resolve_role "$ROLE")
 [ -n "$MODEL" ] || die "role \"$ROLE\" is not configured. Set GATOR_ROLE_$ROLE, or add
          \"$ROLE=<provider>/<model>\" to $ROLES_FILE"
-# It is interpolated into the worker command, so it is a name, not an expression.
-case "$MODEL" in
-  *[!A-Za-z0-9._/-]*) die "model reference for role \"$ROLE\" contains characters that
-         are not allowed in a name: $MODEL";;
-esac
+check_model "$MODEL" "$ROLE"
 
 HASH=$(printf '%s' "$TASK" | tr '[:upper:]' '[:lower:]' | sha256sum | cut -c1-16)
 UNITS=$(jget "$STATE" units 0); LAST=$(jget "$STATE" last 0)

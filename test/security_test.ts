@@ -271,3 +271,99 @@ Deno.test("SEC-6: control characters in planner strings are refused", () => {
   assertStringIncludes(r.out, "candidate_control_characters")
   assertEquals(r.out.includes(esc), false, "no escape reaches the terminal")
 })
+
+// ============================================ roles must reach the controller
+
+Deno.test("ROLES: auto resolves its model from the user's roles file", () => {
+  const dir = specRepo()
+  const roles = join(mkdtempSync(join(tmpdir(), "gator-roles-")), "roles")
+  writeFileSync(roles, "planner = fleet/planner-model\nheavy = fleet/heavy-model\n")
+  // The stub echoes the command it was given, so the test can see the model.
+  const p = join(mkdtempSync(join(tmpdir(), "gator-pl-")), "p.sh")
+  writeFileSync(p, `#!/usr/bin/env bash\ncat >/dev/null\necho '{"candidates":[]}'\n`)
+  Deno.chmodSync(p, 0o755)
+
+  const r = run(dir, ["auto", "plan", "--from", "SPEC.md", "--json"], {
+    GATOR_ROLE_planner: "",
+    GATOR_ROLE_heavy: "",
+    GATOR_ROLES: roles,
+    GATOR_PLANNER_CMD: `bash ${p} %PROVIDER% %MODEL%`,
+    GATOR_VERIFY: "true",
+    GATOR_PLAN_COOLDOWN: "0",
+  })
+  assertEquals(r.code, 0, r.out)
+})
+
+Deno.test("ROLES: a planner role beats the heavy role", () => {
+  const dir = specRepo()
+  const roles = join(mkdtempSync(join(tmpdir(), "gator-roles-")), "roles")
+  writeFileSync(roles, "planner = fleet/chosen\nheavy = fleet/not-this-one\n")
+  const seen = join(mkdtempSync(join(tmpdir(), "gator-seen-")), "cmd")
+  const p = join(mkdtempSync(join(tmpdir(), "gator-pl-")), "p.sh")
+  writeFileSync(
+    p,
+    `#!/usr/bin/env bash\ncat >/dev/null\necho "$@" > ${seen}\necho '{"candidates":[]}'\n`,
+  )
+  Deno.chmodSync(p, 0o755)
+
+  run(dir, ["auto", "plan", "--from", "SPEC.md", "--json"], {
+    GATOR_ROLE_planner: "",
+    GATOR_ROLE_heavy: "",
+    GATOR_ROLES: roles,
+    GATOR_PLANNER_CMD: `bash ${p} %PROVIDER%/%MODEL%`,
+    GATOR_VERIFY: "true",
+    GATOR_PLAN_COOLDOWN: "0",
+  })
+  assertStringIncludes(Deno.readTextFileSync(seen), "fleet/chosen")
+})
+
+Deno.test("ROLES: no planner role refuses clearly, not with a provider error", () => {
+  const dir = specRepo()
+  const roles = join(mkdtempSync(join(tmpdir(), "gator-roles-")), "roles")
+  writeFileSync(roles, "# nothing useful here\n")
+  const r = run(dir, ["auto", "plan", "--from", "SPEC.md", "--json"], {
+    GATOR_ROLE_planner: "",
+    GATOR_ROLE_heavy: "",
+    GATOR_ROLES: roles,
+    GATOR_VERIFY: "true",
+    GATOR_PLAN_COOLDOWN: "0",
+  })
+  assertEquals(r.code, 2)
+  assertStringIncludes(r.out, "planner_role_not_configured")
+  assertEquals(r.out.includes("Unknown provider"), false, "no leaked host error")
+})
+
+Deno.test("ROLES: an untrusted repo roles file cannot name the planner's model", () => {
+  const dir = hostileRepo({ roles: "planner = repo/attacker-model\n" })
+  writeFileSync(join(dir, "SPEC.md"), "# spec\n")
+  git(dir, "add", "-A")
+  git(dir, "commit", "-q", "-m", "spec")
+  const roles = join(mkdtempSync(join(tmpdir(), "gator-roles-")), "roles")
+  writeFileSync(roles, "# the user has configured nothing\n")
+
+  const r = run(dir, ["auto", "plan", "--from", "SPEC.md", "--json"], {
+    GATOR_ROLE_planner: "",
+    GATOR_ROLE_heavy: "",
+    GATOR_ROLES: roles,
+    GATOR_VERIFY: "true",
+    GATOR_PLAN_COOLDOWN: "0",
+  })
+  assertEquals(r.code, 2)
+  assertStringIncludes(r.out, "planner_role_not_configured")
+})
+
+Deno.test("ROLES: a model reference from a roles file cannot carry shell", () => {
+  const dir = specRepo()
+  const pwn = marker()
+  const roles = join(mkdtempSync(join(tmpdir(), "gator-roles-")), "roles")
+  writeFileSync(roles, `planner = p/m$(touch ${pwn})\n`)
+  const r = run(dir, ["auto", "plan", "--from", "SPEC.md", "--json"], {
+    GATOR_ROLE_planner: "",
+    GATOR_ROLE_heavy: "",
+    GATOR_ROLES: roles,
+    GATOR_VERIFY: "true",
+    GATOR_PLAN_COOLDOWN: "0",
+  })
+  assertEquals(existsSync(pwn), false, "the model reference must not reach a shell")
+  assertEquals(r.code, 2)
+})
