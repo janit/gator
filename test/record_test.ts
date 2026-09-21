@@ -196,3 +196,47 @@ Deno.test("finalisation reports the verifier that ran, not one detected later", 
   assertStringIncludes(w.out, "unverified")
   assertStringIncludes(w.out, "verify command: false")
 })
+
+// ====================================== the scheduling decision (spec §15, I6)
+
+Deno.test("I6: the record carries the resource class, backend and queue delay", () => {
+  const path = tmpRecord()
+  rec([
+    "write",
+    path,
+    "slug=u1",
+    "resource.class=heavy",
+    "resource.backend=local-5090",
+    "resource.endpoint=http://127.0.0.1:5091",
+    "resource.eligible=local-5090",
+    "resource.queue_ms=18422",
+    "resource.dispatch_reason=required_backend_available",
+  ])
+  const doc = JSON.parse(Deno.readTextFileSync(path))
+  assertEquals(doc.resource.class, "heavy")
+  assertEquals(doc.resource.backend, "local-5090")
+  // The eligible set is a list in the record even though it crosses the CLI
+  // boundary as a comma string: a reader should not have to re-split it.
+  assertEquals(doc.resource.eligible, ["local-5090"])
+  assertEquals(doc.resource.queue_ms, 18422)
+})
+
+Deno.test("I6: a multi-backend eligible set round-trips as a list", () => {
+  const path = tmpRecord()
+  rec(["write", path, "resource.eligible=local-4090,local-5090"])
+  const doc = JSON.parse(Deno.readTextFileSync(path))
+  assertEquals(doc.resource.eligible, ["local-4090", "local-5090"])
+})
+
+Deno.test("an empty eligible set records as an empty list, not as one empty name", () => {
+  const path = tmpRecord()
+  rec(["write", path, "resource.eligible="])
+  const doc = JSON.parse(Deno.readTextFileSync(path))
+  assertEquals(doc.resource.eligible, [])
+})
+
+Deno.test("get renders a recorded list as JSON for its shell caller", () => {
+  const path = tmpRecord()
+  rec(["write", path, "resource.eligible=local-5090"])
+  assertEquals(rec(["get", path, "resource.eligible", "[]"]).out, '["local-5090"]')
+})

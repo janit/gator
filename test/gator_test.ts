@@ -37,6 +37,9 @@ function run(dir: string, args: string[], env: Record<string, string> = {}) {
     args,
     cwd: dir,
     env: {
+      // A developer's own resources file may configure a classifier. The suite
+      // must never send task text to it, so the default is no file at all.
+      GATOR_RESOURCES: "/dev/null",
       GATOR_ROLE_heavy: "stub/model",
       GATOR_WORKER_CMD: `bash ${workerPath.get(dir)}`,
       GATOR_COOLDOWN: "0",

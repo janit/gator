@@ -3,6 +3,10 @@ import json
 import os
 import sys
 
+from gator_sched import classify as classifier
+from gator_sched.config import ConfigError, load as load_resources, resolution_inputs
+from gator_sched.policy import resolve as resolve_resource
+
 from . import SCHEMA_VERSION
 from . import budget
 from .plan import (
@@ -41,13 +45,54 @@ def emit(payload, as_json):
     return 0
 
 
-def effective_policy(env):
+# The role an automatic unit runs under. The controller assigns it; the planner
+# cannot. `gator feed` defaults to the same role.
+AUTO_ROLE = "heavy"
+
+
+def resources(opts):
+    try:
+        return load_resources(opts.get("config") or [])
+    except ConfigError as exc:
+        raise Refusal(exc.code, str(exc))
+
+
+def recommend(candidates, config):
+    """Controller-owned: where each selectable candidate would run, and who said so.
+
+    After the first sign that the endpoint itself is down, the remaining
+    candidates are not sent. A hung endpoint then costs one timeout, not one
+    per candidate.
+    """
+    unavailable = False
+    for candidate in candidates:
+        def ask(candidate=candidate):
+            nonlocal unavailable
+            if unavailable:
+                return classifier.abstained("endpoint_unavailable")
+            verdict = classifier.classify(
+                config.classifier,
+                candidate["title"],
+                " ".join(candidate["scope"]),
+                candidate["task"],
+            )
+            if verdict.get("abstained") in classifier.TRANSPORT:
+                unavailable = True
+            return verdict
+
+        candidate["resource_recommendation"] = resolve_resource(config, AUTO_ROLE, ask=ask)
+    return candidates
+
+
+def effective_policy(env, resource_config):
     """The values an approval is bound to. Drift here invalidates a plan."""
     return {
         "gates": GATES,
         "min_task_chars": min_task_chars(),
         "max_candidates": MAX_CANDIDATES,
         "max_source_bytes": MAX_SOURCE_BYTES,
+        # What each candidate's recommended class was computed from.
+        "resource_resolution": resolution_inputs(resource_config),
     }
 
 
@@ -70,6 +115,9 @@ def plan(opts):
     facts = repo_facts(opts["repo"])
     secure_store(opts["store"])
     source = load_source(facts["root"], opts["from"])
+
+    # Before the budget: a broken resource config must cost nothing.
+    resource_config = resources(opts)
 
     # Budget first, so a refusal costs nothing. Planning is a model call plus a
     # full verifier run; an agent retrying on refusal must not be able to spend
@@ -126,6 +174,7 @@ def plan(opts):
         "reason": u["reason"],
         "rationale": u["detail"],
     } for u in unusable)
+    recommend(chosen["candidates"], resource_config)
 
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -133,7 +182,7 @@ def plan(opts):
         "target_ref": facts["target_ref"],
         "base_sha": facts["base_sha"],
         "source": {"path": source["path"], "blob_sha": source["blob_sha"]},
-        "policy_hash": policy_hash(effective_policy(env)),
+        "policy_hash": policy_hash(effective_policy(env, resource_config)),
         "verification_profile": profile,
         "baseline": baseline,
         "selected_id": chosen["selected_id"],
@@ -177,6 +226,11 @@ def render(result):
         print(f'  from   {chosen["source_ref"]}')
         print(f'  scope  {" ".join(chosen["scope"])}')
         print(f'  why    {chosen["rationale"]}')
+        rec = chosen.get("resource_recommendation")
+        if rec:
+            why = ("classifier " + classifier.describe(rec)
+                   if rec["source"] == "classifier" else rec["source"])
+            print(f'  class  {rec["class"]} ({why})')
         prior = chosen.get("previously_completed")
         if prior:
             print(
@@ -198,7 +252,10 @@ def show(opts):
     facts = repo_facts(opts["repo"])
     try:
         source = load_source(facts["root"], stored["source"]["path"])
-        reason = check_binding(stored, facts, source, policy_hash(effective_policy(os.environ)))
+        reason = check_binding(
+            stored, facts, source,
+            policy_hash(effective_policy(os.environ, resources(opts))),
+        )
     except Refusal as missing:
         reason = missing.code
 

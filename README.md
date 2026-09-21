@@ -83,6 +83,7 @@ The command is detected from the project (`deno task build && deno task test`,
 | `conflicted` | the merge was aborted; branch left for inspection |
 | `empty` | **it spat the chunk out, nothing committed** — never report this as done |
 | `failed` / `timeout` | the worker errored or spent its budget |
+| `queued` | admitted, but the backend it is allowed to use is busy — see below |
 
 `empty` and `unverified` exist because a confident summary over work that does not
 exist, or does not build, is the characteristic mid-size-model failure.
@@ -106,9 +107,99 @@ reason.
 | `GATOR_VERIFY` | detected | the command that decides "green" |
 | `GATOR_AUTOMERGE` | `1` | set `0` to leave green chunks on their branch |
 | `GATOR_WORKER_CMD` | `pi …` | how to invoke a worker; `%PROVIDER%`/`%MODEL%` substituted |
+| `GATOR_RESOURCES` | `~/.config/gator/resources` | where backends and eligibility are read from |
+| `GATOR_RESOURCE` | — | resource class for one unit; overrides the files |
+| `GATOR_QUEUE` | `1` | set `0` to refuse a unit outright instead of queueing it |
+| `GATOR_PROBE_HEALTH` | `0` | set `1` to run each backend's `health_cmd` before dispatch |
+| `GATOR_BACKEND_TIMEOUT` | `1800` | how long a unit's only backend may be down or disabled before the unit reports `blocked_backend`, seconds |
 
 The gator chews detached, so a chunk outlives the tool call that fed it and
 survives the session being interrupted.
+
+## Which GPU it chews on
+
+If you have more than one local GPU, the roles file answers *which model* does
+the work and a second file answers *where it is allowed to run*. They are
+separate because they are different kinds of statement. A role is a preference.
+An eligibility set is a constraint, and the point of keeping it separate is that
+nothing — not load, not weighting, not a queue backing up — can argue a unit
+onto hardware its class forbids.
+
+`~/.config/gator/resources`, or `.gator/resources` with the same trust opt-in
+that roles and verify need:
+
+```ini
+role.heavy   = heavy        # the heavy role runs as the heavy class
+role.review  = remote
+role.default = standard
+
+backend.local-4090.endpoint = http://127.0.0.1:4091
+backend.local-4090.capacity = 1
+backend.local-4090.weight   = 1.0
+backend.local-4090.interactive_reservation = true
+
+backend.local-5090.endpoint = http://127.0.0.1:5091
+backend.local-5090.capacity = 1
+backend.local-5090.weight   = 1.6
+
+class.standard.eligible = local-4090,local-5090
+class.heavy.eligible    = local-5090
+class.remote.eligible   = fleet
+```
+
+Those `class.*.eligible` lines are hard constraints, and they are the defaults
+even with no file at all. A `heavy` unit runs on the 5090 or it waits. If the
+5090 is busy it queues. If the 5090 is down or disabled for longer than
+`GATOR_BACKEND_TIMEOUT`, the unit is still queued for it, but `gator status`
+reports it as `blocked_backend`. A dead card is detected only with
+`GATOR_PROBE_HEALTH=1`; without it, only `gator sched disable` counts. It never
+quietly lands on the 4090, and a weight claiming the 4090 is a thousand times
+faster does not change that — eligibility is applied before anything is scored.
+
+Ordinary `standard` work is eligible for both, so an idle 5090 always beats a
+busy 4090 and neither card sits idle while there is work it may take.
+
+`interactive_reservation` marks a card you also chat on. While the reservation
+is set, no *new* unit starts there; one already running is left alone.
+
+```bash
+gator sched reserve --backend local-4090 --on    # chat is using it
+gator sched reserve --backend local-4090 --off   # it is free again
+gator sched status                               # what each backend is doing
+```
+
+The worker command gets `%RESOURCE%`, `%BACKEND%` and `%ENDPOINT%` alongside
+`%PROVIDER%` and `%MODEL%`, so a worker can be pointed at an already-running
+model server without a GPU id ever appearing in Gator's role logic.
+
+There is no scheduler daemon. A queued unit gets its turn when the unit ahead of
+it releases its slot, or at the next `gator status` or `gator wait`.
+
+### Letting a model pick the class
+
+When nothing you configured decides a unit's class (no `--resource`, no
+`role.<role>` mapping, no explicit `role.default`), gator can ask a model how
+hard the task is. It is off unless the resources file names an endpoint:
+
+```ini
+classifier.endpoint  = http://localhost:8086/v1
+classifier.model     = Qwen3.8-27B
+classifier.threshold = 0.75   # demote to standard only when at least this sure
+classifier.timeout   = 5
+```
+
+The rule is conservative. A unit stays `heavy` unless the model gives
+`standard` at least the threshold's probability. A timeout, an unreachable
+endpoint or an answer that does not parse all keep it `heavy`, and the record
+says why. The model can choose only between `heavy` and `standard`, and your own
+settings always win. The order is `--resource` / `GATOR_RESOURCE`, then a role
+mapping, then an explicit `role.default`, then the classifier, then the built-in
+default. `FED`, `QUEUED` and `status` lines show which of these decided
+(`source=`).
+
+The endpoint receives the task text, so a cloned repository's own
+`.gator/resources` cannot set it. See
+[docs/scheduling.md](docs/scheduling.md#automatic-classification).
 
 ## Automatic selection
 
@@ -172,16 +263,22 @@ not bound the worker.
 
 **The repository is untrusted input.** `.gator/` lives inside it and a
 repository can commit its own, so a clone can arrive carrying a `roles` file
-that names the command to run, or a `verify` file that the baseline check would
-execute. Both are ignored unless you say otherwise:
+that names the command to run, a `verify` file that the baseline check would
+execute, or a `resources` file naming endpoints and a health command — and
+claiming that `heavy` may run anywhere it likes. All three are ignored unless
+you say otherwise:
 
 ```bash
 GATOR_TRUST_REPO_CONFIG=1 gator ...   # this repository's .gator/ is mine
 ```
 
-Without it, a repository-supplied `roles` or `verify` is skipped with a note on
-stderr, and `auto plan` refuses for want of an approved verifier rather than
-running a stranger's shell. Set it only for repositories you wrote.
+Without it, a repository-supplied `roles`, `verify` or `resources` is skipped
+with a note on stderr, and `auto plan` refuses for want of an approved verifier
+rather than running a stranger's shell. Set it only for repositories you wrote.
+
+Task text has no authority over any of this either. A chunk that asks to be
+scheduled somewhere is asking the model that reads it, not the scheduler, which
+never sees the prompt.
 
 ## Tests
 

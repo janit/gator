@@ -38,7 +38,13 @@ function walk(dir: string, prefix = ""): string[] {
 const files = walk(src)
 
 // Entry points the shell invokes directly; everything else is imported.
-const EXECUTABLE = new Set(["gator", "gator-unit", "gator-auto.py", "gator-record.py"])
+const EXECUTABLE = new Set([
+  "gator",
+  "gator-unit",
+  "gator-auto.py",
+  "gator-record.py",
+  "gator-sched.py",
+])
 
 function install(destDir: string) {
   for (const name of files) {

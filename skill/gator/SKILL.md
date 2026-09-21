@@ -48,6 +48,12 @@ altogether if that is what you mean.
 quoting a long string. If `gator` is not on your `PATH`, run it as `./gator` from
 the repository.
 
+`--resource <class>` says where the chunk is allowed to run when the machine has
+more than one local GPU — `heavy` for work pinned to the big card, `standard`
+for work either card may take. You rarely need it: the role already implies a
+class. Passing it overrides that for one unit; it cannot widen what a class is
+eligible for.
+
 Then either poll or block:
 
 ```bash
@@ -132,8 +138,12 @@ Report the status plainly, including the bad ones:
 | `out_of_scope` | **it changed files outside the scope you gave it** — not merged, worktree kept |
 | `failed` / `timeout` | the worker errored or ran out of its budget |
 | `no_candidate` | **`auto plan` found nothing eligible** — a success, and the honest answer |
+| `queued` | accepted, but the GPU its class is allowed to use is busy; it starts when that frees |
 
 `empty` and `unverified` both matter: a confident summary over work that does not
 exist, or does not build, is the characteristic mid-size-model failure. Reporting
 either as success is the worst thing you can do. For `unverified` you are given
 the build output — feed a fix against that branch, or fix it yourself.
+
+`queued` is not a failure and not a refusal. Say which backend it is waiting for
+and carry on; `gator wait` will block until it has actually run.

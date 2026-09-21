@@ -5,4 +5,4 @@ what this does, and Python is already a hard runtime dependency of `gator`.
 Deno stays the test and lint harness; auto adds no runtime TypeScript.
 """
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2

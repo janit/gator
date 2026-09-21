@@ -71,7 +71,7 @@ Deno.test("a stub planner's valid output produces a plan", () => {
   assertEquals(r.code, 0, r.out)
   const plan = JSON.parse(r.out)
   assertEquals(plan.selected_id, "token-refresh")
-  assertEquals(plan.schema_version, 1)
+  assertEquals(plan.schema_version, 2)
 })
 
 Deno.test("§9.2: an empty candidate list is a successful no-candidate plan", () => {

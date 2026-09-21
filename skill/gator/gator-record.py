@@ -54,6 +54,13 @@ INT_KEYS = frozenset({
     "verify.elapsed",
     "launched_at",
     "baseline.rc",
+    "resource.queue_ms",
+})
+# The eligible set crosses the shell boundary as a comma string because argv
+# carries strings. It is a list in the record, so nothing downstream has to
+# know that and re-split it.
+LIST_KEYS = frozenset({
+    "resource.eligible",
 })
 
 
@@ -65,6 +72,8 @@ def coerce(key, text):
             return int(text)
         except ValueError:
             return -1
+    if key in LIST_KEYS:
+        return [item.strip() for item in text.split(",") if item.strip()]
     return text
 
 

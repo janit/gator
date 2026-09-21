@@ -56,7 +56,7 @@ def fail(code, message, as_json):
 
 def parse(argv):
     opts = {"repo": None, "store": None, "verb": None, "from": None, "plan": None,
-            "json": False, "no_baseline": False}
+            "json": False, "no_baseline": False, "config": []}
     rest = []
     i = 0
     while i < len(argv):
@@ -65,6 +65,8 @@ def parse(argv):
             opts["repo"] = argv[i + 1]; i += 2
         elif a == "--store":
             opts["store"] = argv[i + 1]; i += 2
+        elif a == "--config":
+            opts["config"].append(argv[i + 1]); i += 2
         elif a == "--from":
             opts["from"] = argv[i + 1]; i += 2
         elif a == "--plan":

@@ -1,0 +1,125 @@
+{
+  "note": "Written by hand from gator's own backlog, not drawn from real unit history. Extend it with real tasks as outcomes accumulate.",
+  "tasks": [
+    {
+      "label": "heavy",
+      "title": "Lease store to SQLite",
+      "scope": "skill/gator/gator_sched/**",
+      "task": "Migrate the lease store from flocked JSON files to SQLite across leases.py, health.py and the gator shell script, preserving fail-closed semantics on corrupt state, with a migration path for existing .gator/sched state and tests for concurrent acquisition."
+    },
+    {
+      "label": "heavy",
+      "title": "RFC 8785 canonical plans",
+      "scope": "skill/gator/gator_auto/**",
+      "task": "Replace the hand-rolled plan canonicalisation with RFC 8785 JSON canonicalisation across save, load and hashing, keeping every plan stored under the old scheme verifiable and refusing any plan whose bytes could hash two ways."
+    },
+    {
+      "label": "heavy",
+      "title": "Preempt standard work",
+      "scope": "skill/gator/**",
+      "task": "Let a waiting heavy unit preempt a running standard unit on the 5090: stop the worker, checkpoint its worktree, requeue it with its original admission time, and prove no committed work is ever lost or merged twice."
+    },
+    {
+      "label": "heavy",
+      "title": "gator auto run",
+      "scope": "skill/gator/**",
+      "task": "Implement gator auto run: execute an approved plan's selected candidate, enforce its scope against the resulting diff, bind the verifier recorded in the plan, and refuse on any stale binding, with exit codes per spec section 4."
+    },
+    {
+      "label": "heavy",
+      "title": "Fair queue across repos",
+      "scope": "skill/gator/**",
+      "task": "Make the queue fair across repositories sharing one scheduler store, with a starvation bound that is asserted in tests, touching leases.py, policy.py and drain_queue in the gator shell script."
+    },
+    {
+      "label": "heavy",
+      "title": "Streaming plan extractor",
+      "scope": "skill/gator/gator_auto/planner.py",
+      "task": "Rewrite the planner output extractor as a streaming JSON parser with a hard memory bound, preserving every existing refusal code and the fenced-block preference, and prove the bound with a test that feeds it an adversarial stream."
+    },
+    {
+      "label": "heavy",
+      "title": "Port feed to Python",
+      "scope": "skill/gator/**",
+      "task": "Port the feed path of the gator shell script to Python while keeping byte-identical output, identical exit codes, the same trust gate for repository config, and every existing test green."
+    },
+    {
+      "label": "heavy",
+      "title": "Cross-host leases",
+      "scope": "skill/gator/gator_sched/**",
+      "task": "Allow leases to be held in a store shared between hosts over NFS: correct locking semantics, fencing tokens so a stale holder cannot act, and recovery when a host dies while holding a lease."
+    },
+    {
+      "label": "heavy",
+      "title": "Resident scheduler",
+      "scope": "skill/gator/**",
+      "task": "Introduce an optional resident scheduler daemon that owns leases, with a crash-safe handoff so the existing file-based path keeps working, unchanged, whenever the daemon is down or absent."
+    },
+    {
+      "label": "heavy",
+      "title": "Force-updated branches",
+      "scope": "skill/gator/**",
+      "task": "Detect and repair unit worktrees whose branch was force-updated while the unit ran, across status, wait and merge, without ever merging a commit the verifier did not see."
+    },
+    {
+      "label": "standard",
+      "title": "auto plans --json",
+      "scope": "skill/gator/gator-auto.py",
+      "task": "Add a --json flag to gator auto plans that prints the plan listing as JSON. Scope: skill/gator/gator-auto.py and skill/gator/gator_auto/commands.py."
+    },
+    {
+      "label": "standard",
+      "title": "Rename cnt",
+      "scope": "skill/gator/gator_sched/leases.py",
+      "task": "Rename the local variable cnt to count throughout skill/gator/gator_sched/leases.py. No behaviour change."
+    },
+    {
+      "label": "standard",
+      "title": "Fix refusal wording",
+      "scope": "skill/gator/gator_auto/planner.py",
+      "task": "Fix the wording of the planner_input_too_large refusal message in planner.py so it reads as one grammatical sentence. No behaviour change."
+    },
+    {
+      "label": "standard",
+      "title": "status --quiet",
+      "scope": "skill/gator/gator",
+      "task": "Add a --quiet flag to gator status that suppresses the per-unit resource line and prints everything else unchanged."
+    },
+    {
+      "label": "standard",
+      "title": "Sort sched status",
+      "scope": "skill/gator/gator-sched.py",
+      "task": "Make gator sched status print backends sorted by id instead of insertion order."
+    },
+    {
+      "label": "standard",
+      "title": "Timeout test",
+      "scope": "test/sched_config_test.ts",
+      "task": "Add one unit test asserting that classifier.timeout = 0 is refused with bad_timeout."
+    },
+    {
+      "label": "standard",
+      "title": "Document GATOR_POLL",
+      "scope": "README.md",
+      "task": "Document the GATOR_POLL environment variable in README.md under Configuration, with its default of 10 seconds."
+    },
+    {
+      "label": "standard",
+      "title": "Planner timeout default",
+      "scope": "skill/gator/gator_auto/repo.py",
+      "task": "Change the default planner timeout from its current value to 180 seconds and update the comment that states it."
+    },
+    {
+      "label": "standard",
+      "title": "Ignore .serena",
+      "scope": ".gitignore",
+      "task": "Add the .serena/ directory to .gitignore."
+    },
+    {
+      "label": "standard",
+      "title": "Missing queue_ms",
+      "scope": "skill/gator/gator-record.py",
+      "task": "Make gator-record.py print a missing resource.queue_ms as 0 rather than an empty value."
+    }
+  ]
+}

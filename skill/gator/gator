@@ -45,18 +45,30 @@ grep -qxF '.gator/' "$EXCL" 2>/dev/null || echo '.gator/' >> "$EXCL"
 # file means no model id lives in the code and no shell profile has to be edited.
 ROLES_FILE="${GATOR_ROLES:-${XDG_CONFIG_HOME:-$HOME/.config}/gator/roles}"
 
+# Resources: a name to a place it may run. Roles answer which model does the
+# work; this answers which GPU is allowed to execute it. They are deliberately
+# separate files, because they are different kinds of statement — a role is a
+# preference and an eligibility set is a constraint.
+RESOURCES_FILE="${GATOR_RESOURCES:-${XDG_CONFIG_HOME:-$HOME/.config}/gator/resources}"
+SCHED="$HERE/gator-sched.py"
+
 # The repository is untrusted input. `.gator/` lives inside it, and a repository
 # can commit its own — `.git/info/exclude` suppresses only untracked files. A
 # cloned `.gator/roles` supplying `worker_cmd`, or a cloned `.gator/verify`, is
 # arbitrary code that runs the moment anyone uses the gator here. So repository
 # config is ignored unless the user opts in for this invocation.
 trust_repo_config(){ [ "${GATOR_TRUST_REPO_CONFIG:-0}" = "1" ]; }
+# Once per file, not once per session: there are three of these now, and being
+# told about the ignored `roles` is no reason to stay quiet about an ignored
+# `resources` that was trying to say heavy may run anywhere.
 warn_untrusted(){
-  local f="$1"
+  local f="$1" key
   [ -f "$f" ] || return 0
   trust_repo_config && return 0
-  [ -n "${GATOR_WARNED_REPO_CONFIG:-}" ] && return 0
-  export GATOR_WARNED_REPO_CONFIG=1
+  key="${f##*/}"
+  key="GATOR_WARNED_${key//[^A-Za-z0-9]/_}"
+  [ -n "${!key:-}" ] && return 0
+  export "$key=1"
   log "note: ignoring repository-supplied $f — it can name the command that runs."
   log "      Set GATOR_TRUST_REPO_CONFIG=1 if you wrote it and want it used."
 }
@@ -94,6 +106,28 @@ resolve_role(){
   printf '%s'
 }
 
+# Resource config selects endpoints and reaches the worker command, so it is
+# executable-policy-adjacent and passes the same trust gate as roles and verify.
+# Untrusted, the repository's file is not ranked below the user's — it is not
+# read at all. The scheduler is handed the files, in order; it does the parsing,
+# because these keys are dotted and a shell grep would over-match them.
+resource_files(){
+  warn_untrusted "$STORE/resources"
+  trust_repo_config && echo "$STORE/resources"
+  echo "$RESOURCES_FILE"
+  return 0
+}
+
+SCHED_CFG=()
+load_sched_config(){
+  local f
+  SCHED_CFG=()
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$f" ] && SCHED_CFG+=(--config "$f")
+  done < <(resource_files)
+  return 0
+}
+
 # A model reference is substituted into a command string, so it is a name and
 # not an expression. Both `feed` and `auto` route their model through here.
 check_model(){
@@ -102,6 +136,23 @@ check_model(){
          are not allowed in a name: $1";;
   esac
 }
+
+# A backend id, an endpoint and a resource class all join the model in that
+# command string, so each gets the same treatment. Config is trusted to be
+# config; it is not trusted to be shell.
+check_name(){
+  case "$1" in
+    *[!A-Za-z0-9._/-]*) die "$2 contains characters that are not allowed in a name: $1";;
+  esac
+}
+check_endpoint(){
+  case "$1" in
+    *[!A-Za-z0-9._:/?=\&%@~+-]*) die "endpoint is not a plain URL: $1";;
+  esac
+}
+
+sched_field(){ printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1; }
+qget(){ python3 "$HERE/gator-record.py" get "$1" "$2" "$3"; }
 
 # What "green" means here. Explicit config wins; otherwise infer it from the
 # project, and if nothing is recognised, fall back to merge-on-clean and say so.
@@ -127,6 +178,74 @@ VERIFY=$(detect_verify)
 
 rget(){ python3 "$HERE/gator-record.py" get "$1" "$2" "$3"; }
 
+# Launching is separate from feeding, because a unit may be admitted long after
+# it was fed: the backend it needs can be busy at feed time and free an hour
+# later. Everything a launch needs is therefore an argument, and the same code
+# path serves the immediate case and the drained-from-the-queue case.
+launch_unit(){
+  local slug="$1" dir="$2" tmpl="$3" backend="$4" endpoint="$5" resource="$6"
+  local eligible="$7" reason="$8" rec="$9" title="${10}" verify="${11}" qat="${12}"
+  local scope="${13:-}"
+  check_name "$backend" "backend id"
+  check_endpoint "$endpoint"
+  check_name "$resource" "resource class"
+  local cmd="$tmpl"
+  cmd="${cmd//%RESOURCE%/$resource}"
+  cmd="${cmd//%BACKEND%/$backend}"
+  cmd="${cmd//%ENDPOINT%/$endpoint}"
+  local qms=0
+  [ "$qat" != "0" ] && qms=$(python3 -c 'import sys,time;print(int((time.time()-float(sys.argv[1]))*1000))' "$qat")
+  python3 "$HERE/gator-record.py" write "$rec" \
+    "resource.class=$resource" "resource.backend=$backend" \
+    "resource.endpoint=$endpoint" "resource.eligible=$eligible" \
+    "resource.dispatch_reason=$reason" "resource.queue_ms=$qms"
+  touch "$STORE/$slug.lock"
+  setsid nohup "$HERE/gator-unit" "$STORE" "$slug" "$dir" "$cmd" "$UNIT_TIMEOUT" "$title" "$verify" "$rec" "$scope" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+# Gator has no resident scheduler. A queued unit is picked up at the next moment
+# something is already happening: another feed, a status or wait, or — the one
+# that matters for keeping a GPU busy — the release of the lease that was in its
+# way, by the unit that held it.
+drain_queue(){
+  local slug q out rc role resource title reason
+  ls "$STORE"/*.queued.json >/dev/null 2>&1 || return 0
+  load_sched_config
+  # Probed here as at feed time: a unit queued behind a dead backend must not be
+  # launched into it just because the drain did not look.
+  local probe=(); [ "${GATOR_PROBE_HEALTH:-0}" = "1" ] && probe=(--probe)
+  for slug in $(python3 "$SCHED" queue --store "$STORE" "${SCHED_CFG[@]}" 2>/dev/null); do
+    q="$STORE/$slug.queued.json"
+    [ -f "$q" ] || continue
+    role=$(qget "$q" role heavy)
+    resource=$(qget "$q" resource "")
+    title=$(qget "$q" title "$slug")
+    out=$(python3 "$SCHED" dispatch --store "$STORE" --slug "$slug" --role "$role" \
+      ${resource:+--override "$resource"} --pid 0 --tokens "$(qget "$q" tokens 0)" \
+      --queued "${SCHED_CFG[@]}" "${probe[@]}" 2>&1); rc=$?
+    if [ "$rc" -ne 0 ]; then
+      # Still queued. If the reason changed — the backend it needs has been gone
+      # past the availability timeout, or has come back — the record says so too.
+      if [ "$(sched_field "$out" changed)" = "1" ]; then
+        reason=$(sched_field "$out" reason)
+        python3 "$HERE/gator-record.py" write "$STORE/$slug.record.json" \
+          "resource.dispatch_reason=$reason"
+        [ "$reason" = "blocked_backend" ] && echo "BLOCKED \"$title\" → required_backend=$(sched_field "$out" required_backend) is $(sched_field "$out" required_state) past GATOR_BACKEND_TIMEOUT; still queued for it"
+      fi
+      continue
+    fi
+    launch_unit "$slug" "$(qget "$q" dir "")" "$(qget "$q" cmd "")" \
+      "$(sched_field "$out" backend)" "$(sched_field "$out" endpoint)" \
+      "$(sched_field "$out" resource)" "$(sched_field "$out" eligible)" \
+      "$(sched_field "$out" reason)" "$STORE/$slug.record.json" \
+      "$title" "$(qget "$q" verify "")" "$(qget "$q" queued_at 0)" "$(qget "$q" scope "")"
+    rm -f "$q"
+    echo "DISPATCHED \"$title\" → backend=$(sched_field "$out" backend)"
+  done
+  return 0
+}
+
 # Has the unit reported back? The record answers this, not `.done`: finalising
 # renames `.done` to `.reported`, so a second, purely observational read must
 # not mistake a finished unit for a running one.
@@ -140,22 +259,43 @@ unit_finished(){
   [ -f "$STORE/$1.done" ] || [ -f "$STORE/$1.reported" ]
 }
 
+# Who decided a unit's class, for status lines. Empty for units fed before the
+# classifier existed, so old records print exactly as they did.
+res_detail(){
+  local s c
+  s=$(rget "$1" resource.source "")
+  c=$(rget "$1" resource.classifier "")
+  [ -n "$s" ] && printf ' source=%s' "$s"
+  [ -n "$c" ] && printf ' classifier="%s"' "$c"
+  return 0
+}
+
 # Reporting is a pure read. It prints the unit's status and sets OUTCOME, and
 # it never merges, removes a worktree or marks a unit reported. Automatic units
 # need an observational status (spec section 7); this is that path, built while
 # legacy is still its only caller.
 report_unit(){
-  local SLUG="$1" DIR BRANCH REC AHEAD ELAPSED VCMD
+  local SLUG="$1" DIR BRANCH REC AHEAD ELAPSED VCMD Q
   DIR="$STORE/worktrees/$SLUG"; BRANCH="gator/$SLUG"; REC="$STORE/$SLUG.record.json"
+  Q="$STORE/$SLUG.queued.json"
+  # A queued unit has not started, so it is not chewing. Saying which backend it
+  # is waiting for is the difference between "stuck" and "working as designed".
+  if [ -f "$Q" ]; then
+    OUTCOME="queued"
+    echo "UNIT \"$(qget "$Q" title "$SLUG")\" → queued  [resource=$(qget "$Q" resource "") reason=$(qget "$Q" reason waiting_for_required_backend) required_backend=$(qget "$Q" required_backend "")$(res_detail "$REC")]"
+    return 0
+  fi
   if ! unit_finished "$SLUG"; then
     OUTCOME="chewing"
     echo "UNIT \"$SLUG\" → chewing ($(ls "$DIR" 2>/dev/null | wc -l) files in its worktree so far)"
+    echo "  resource=$(rget "$REC" resource.class "") backend=$(rget "$REC" resource.backend "")$(res_detail "$REC")"
     return 0
   fi
   OUTCOME=$(python3 "$HERE/gator-record.py" outcome "$REC")
   AHEAD=$(rget "$REC" result.ahead 0)
   ELAPSED=$(rget "$REC" worker.elapsed 0)
   echo "UNIT \"$SLUG\" → ${OUTCOME}  [${ELAPSED}s, ${AHEAD} commit(s), branch ${BRANCH}]"
+  echo "  resource=$(rget "$REC" resource.class "") backend=$(rget "$REC" resource.backend "") queue_ms=$(rget "$REC" resource.queue_ms 0) dispatch_reason=$(rget "$REC" resource.dispatch_reason "")$(res_detail "$REC")"
   if [ "$OUTCOME" = "out_of_scope" ]; then
     echo "NOT merged: the unit changed files outside the scope it was given."
     echo "declared scope: $(rget "$REC" scope_declared "")"
@@ -224,6 +364,7 @@ finalise(){
     report_unit "$SLUG"
   else
     echo "UNIT \"$SLUG\" → ${STATUS}${EXTRA}  [${ELAPSED}s, ${AHEAD} commit(s), branch ${BRANCH}]"
+    echo "  resource=$(rget "$REC" resource.class "") backend=$(rget "$REC" resource.backend "") queue_ms=$(rget "$REC" resource.queue_ms 0) dispatch_reason=$(rget "$REC" resource.dispatch_reason "")$(res_detail "$REC")"
     SUMMARY=$(tail -c 400 "$STORE/$SLUG.log" 2>/dev/null | tr '\n' ' ')
     echo "worker said: ${SUMMARY:- (no output)}"
   fi
@@ -249,10 +390,14 @@ if [ "${1:-}" = "auto" ]; then
     pc=$(resolve_role planner_cmd)
     [ -n "$pc" ] && export GATOR_PLANNER_CMD="$pc"
   fi
-  exec python3 "$HERE/gator-auto.py" --repo "$REPO" --store "$STORE" "$@"
+  # Resource config passes the same trust gate here as for feed: it names the
+  # endpoint that task text is sent to.
+  load_sched_config
+  exec python3 "$HERE/gator-auto.py" --repo "$REPO" --store "$STORE" "${SCHED_CFG[@]}" "$@"
 fi
 
 TITLE=""; ROLE="heavy"; SCOPE=""; TASK=""; MODE=feed; JSON=0; NO_MERGE=0; OUTCOME=""
+RESOURCE=""
 # A verb first reads the way the thing works: you feed the gator a chunk of work
 # and it chews on it. The old flag forms still parse, so nothing that already
 # calls this breaks.
@@ -260,13 +405,22 @@ case "${1:-}" in
   feed)   MODE=feed;   shift ;;
   status) MODE=status; shift ;;
   wait)   MODE=wait;   shift ;;
+  drain)  MODE=drain;  shift ;;
+  sched)  MODE=sched;  shift ;;
 esac
+# `sched` hands the rest straight to the scheduler, so an operator can reserve
+# the 4090 for chat or read backend state without learning a second command.
+if [ "$MODE" = "sched" ]; then
+  load_sched_config
+  exec python3 "$SCHED" "${1:-status}" --store "$STORE" "${@:2}" "${SCHED_CFG[@]}"
+fi
 while [ $# -gt 0 ]; do
   case "$1" in
     --title) TITLE="${2:-}"; shift 2;;
     --role)  ROLE="${2:-}";  shift 2;;
     --scope) SCOPE="${2:-}"; shift 2;;
     --task)  TASK="${2:-}";  shift 2;;
+    --resource) RESOURCE="${2:-}"; shift 2;;
     --status) MODE=status; shift;;
     --wait)   MODE=wait;   shift;;
     --json)   JSON=1; shift;;
@@ -275,7 +429,15 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# The queue is drained wherever we are already doing something: gator has no
+# resident scheduler, so these are the moments a waiting unit gets its chance.
+if [ "$MODE" = "drain" ]; then
+  drain_queue
+  exit 0
+fi
+
 if [ "$MODE" = "status" ] || [ "$MODE" = "wait" ]; then
+  drain_queue
   U=$(units)
   if [ -z "$U" ]; then
     [ "$JSON" = "1" ] && { python3 "$HERE/gator-record.py" collect "$STORE"; exit 0; }
@@ -320,8 +482,15 @@ sys.exit(1 if sys.argv[2] in d.get("hashes",[]) else 0)' "$STATE" "$HASH" \
 [ "$UNITS" -lt "$MAX_PER_SESSION" ] || die "feeding budget spent for this session ($UNITS/$MAX_PER_SESSION)."
 NOW=$(date +%s); SINCE=$((NOW-LAST))
 [ "$LAST" -eq 0 ] || [ "$SINCE" -ge "$COOLDOWN" ] || die "still digesting the last one, $((COOLDOWN-SINCE))s remaining."
+# A full jaw used to be a refusal. It is now a queue, because the scheduler has
+# somewhere to put the unit and a reason to start it later — but the refusal is
+# still one environment variable away for anyone who preferred it.
 INFLIGHT=$(ls -1 "$STORE"/*.lock 2>/dev/null | wc -l)
-[ "$INFLIGHT" -lt "$MAX_CONCURRENT" ] || die "the gator already has its jaws full ($INFLIGHT chewing >= $MAX_CONCURRENT)."
+FULL=0
+if [ "$INFLIGHT" -ge "$MAX_CONCURRENT" ]; then
+  [ "${GATOR_QUEUE:-1}" = "1" ] || die "the gator already has its jaws full ($INFLIGHT chewing >= $MAX_CONCURRENT)."
+  FULL=1
+fi
 
 if [ -n "$(git -C "$REPO" status --porcelain -- . ':(exclude).gator')" ]; then
   log "warning: your working tree has uncommitted changes. The gator eats from committed"
@@ -331,8 +500,63 @@ fi
 SLUG=$(printf '%s' "$TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/-/g;s/^-//;s/-$//' | cut -c1-32)
 DIR="$STORE/worktrees/$SLUG"; BRANCH="gator/$SLUG"
 git -C "$REPO" show-ref --verify --quiet "refs/heads/$BRANCH" && die "branch $BRANCH already exists; rename the unit."
-git -C "$REPO" worktree add -q -b "$BRANCH" "$DIR" HEAD || die "could not create worktree"
-touch "$STORE/$SLUG.lock"
+
+# Where the unit is allowed to run. The role has already answered which model
+# does the work; this is the other question, and it is asked separately because
+# no answer to it may be talked out of by load.
+#
+# It is asked here, before anything is created, because a refusal must cost
+# nothing: no branch, no worktree, no spent budget. A unit that will queue does
+# get all three — it was admitted, it is simply not started yet.
+[ -n "$RESOURCE" ] || RESOURCE="${GATOR_RESOURCE:-}"
+[ -z "$RESOURCE" ] || check_name "$RESOURCE" "resource class"
+load_sched_config
+PROBE=(); [ "${GATOR_PROBE_HEALTH:-0}" = "1" ] && PROBE=(--probe)
+
+# The class is decided once, here, and every later step is handed the answer.
+# Resolving it again at enqueue time could disagree with dispatch, and with a
+# model in the loop a second call is a second opinion. It happens outside the
+# lease lock, because a classifier can take seconds to answer. The task goes on
+# stdin: one argv string is capped at 128 KB and a task from a file can be
+# longer.
+RES_OUT=$(python3 "$SCHED" resolve --store "$STORE" --role "$ROLE" \
+  ${RESOURCE:+--override "$RESOURCE"} --title "$TITLE" --scope "$SCOPE" --task-stdin \
+  "${SCHED_CFG[@]}" 2>&1 < <(printf '%s' "$TASK")) || die "the scheduler refused this unit: $RES_OUT"
+RES_CLASS=$(sched_field "$RES_OUT" resource)
+RES_ELIGIBLE=$(sched_field "$RES_OUT" eligible)
+RES_SOURCE=$(sched_field "$RES_OUT" source)
+RES_CLASSIFIER=$(sched_field "$RES_OUT" classifier)
+[ -n "$RES_CLASS" ] || die "the scheduler named no resource class for this unit: $RES_OUT"
+check_name "$RES_CLASS" "resource class"
+case "$RES_CLASSIFIER" in
+  abstained:*) log "classifier abstained (${RES_CLASSIFIER#abstained:}) — kept at heavy" ;;
+esac
+RES_NOTE=""
+[ "$RES_SOURCE" = "classifier" ] && RES_NOTE=" (classifier $RES_CLASSIFIER)"
+
+if [ "$FULL" = "1" ]; then
+  DRC=3
+  DOUT="reason=global_concurrency_reached"
+else
+  DOUT=$(python3 "$SCHED" dispatch --store "$STORE" --slug "$SLUG" --role "$ROLE" \
+    --override "$RES_CLASS" --pid 0 --tokens "$LEN" \
+    "${SCHED_CFG[@]}" "${PROBE[@]}" 2>&1); DRC=$?
+fi
+[ "$DRC" -ne 2 ] || die "the scheduler refused this unit: $DOUT"
+if [ "$DRC" -eq 3 ] && [ "${GATOR_QUEUE:-1}" != "1" ]; then
+  die "no backend is available for this unit: $DOUT"
+fi
+
+# From here the lease may already be held, so every failure has to give it back
+# rather than leave a backend claimed by a unit that was never created.
+release_lease(){ python3 "$SCHED" release --store "$STORE" --slug "$SLUG" 2>/dev/null || true; }
+git -C "$REPO" worktree add -q -b "$BRANCH" "$DIR" HEAD || {
+  [ "$DRC" -eq 0 ] && release_lease
+  die "could not create worktree"
+}
+# The worktree is created now, even for a unit that will queue, so the unit
+# still chews the tree its feeder saw. The lock is not: it means "running", and
+# it is taken in launch_unit at the moment the worker is actually spawned.
 # Written through a temporary file and an atomic rename: a crash mid-write must
 # not leave the budget unreadable (spec section 7).
 python3 -c 'import json,os,sys,tempfile
@@ -376,14 +600,36 @@ python3 "$HERE/gator-record.py" write "$RECORD" \
   "slug=$SLUG" "title=$TITLE" "branch=$BRANCH" \
   "base_sha=$BASE_SHA" "target_ref=$TARGET_REF" \
   "scope_declared=$SCOPE" "role=$ROLE" "model=$MODEL" \
+  "resource.source=$RES_SOURCE" "resource.classifier=$RES_CLASSIFIER" \
   "verify.configured=$VCONF" "verify.command=$VERIFY" "verify.command_sha256=$VERIFY_SHA" \
   "worker.launch_error=true" "launched_at=$NOW"
 
-setsid nohup "$HERE/gator-unit" "$STORE" "$SLUG" "$DIR" "$CMD" "$UNIT_TIMEOUT" "$TITLE" "$VERIFY" "$RECORD" "$SCOPE" >/dev/null 2>&1 &
-disown 2>/dev/null || true
-
-echo "FED \"$TITLE\" → role=$ROLE model=$MODEL branch=$BRANCH"
+if [ "$DRC" -eq 0 ]; then
+  BACKEND=$(sched_field "$DOUT" backend)
+  launch_unit "$SLUG" "$DIR" "$CMD" "$BACKEND" "$(sched_field "$DOUT" endpoint)" \
+    "$(sched_field "$DOUT" resource)" "$(sched_field "$DOUT" eligible)" \
+    "$(sched_field "$DOUT" reason)" "$RECORD" "$TITLE" "$VERIFY" 0 "$SCOPE"
+  echo "FED \"$TITLE\" → role=$ROLE model=$MODEL resource=$(sched_field "$DOUT" resource)$RES_NOTE backend=$BACKEND branch=$BRANCH"
+else
+  REASON=$(sched_field "$DOUT" reason)
+  REQUIRED=$(sched_field "$DOUT" required_backend)
+  python3 "$SCHED" enqueue --store "$STORE" --slug "$SLUG" \
+    --field "title=$TITLE" --field "dir=$DIR" --field "cmd=$CMD" \
+    --field "verify=$VERIFY" --field "role=$ROLE" --field "resource=$RES_CLASS" \
+    --field "scope=$SCOPE" \
+    --field "tokens=$LEN" --field "reason=$REASON" --field "required_backend=$REQUIRED" \
+    --field "required_state=$(sched_field "$DOUT" required_state)"
+  python3 "$HERE/gator-record.py" write "$RECORD" \
+    "resource.class=$RES_CLASS" "resource.eligible=$RES_ELIGIBLE" \
+    "resource.dispatch_reason=$REASON"
+  echo "QUEUED \"$TITLE\" → role=$ROLE model=$MODEL resource=$RES_CLASS$RES_NOTE branch=$BRANCH"
+  echo "waiting: $REASON${REQUIRED:+ ($REQUIRED)}"
+fi
 echo "verify before merge: ${VERIFY:-<none detected — this chunk will merge on clean, not on green>}"
-echo "The gator is chewing, detached in the background. Check on it with 'gator status',"
+if [ "$DRC" -eq 0 ]; then
+  echo "The gator is chewing, detached in the background. Check on it with 'gator status',"
+else
+  echo "The gator will start on it as soon as its backend frees. Check on it with 'gator status',"
+fi
 echo "or block until it has swallowed everything with 'gator wait'. Do not feed it the"
 echo "same chunk twice."
