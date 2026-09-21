@@ -50,6 +50,22 @@ def validate_scope(patterns):
     return out
 
 
+def safe_text(value, limit=200):
+    """Make planner-supplied text safe to print and to store.
+
+    A control character can erase the line a tool just printed and substitute
+    the model's own, which is finding 6 of the 2026-09-20 review. Validated
+    fields are refused outright for containing them; this is for the values that
+    are reported *because* validation failed, where refusing is not an option
+    and the raw bytes must still never reach a terminal or a manifest.
+    """
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else str(value)
+    rendered = CONTROL_CHARS.sub(lambda m: "\\x%02x" % ord(m.group()), text)
+    return rendered[:limit]
+
+
 def validate_candidates(raw, limits):
     if not isinstance(raw, dict):
         raise Refusal("planner_invalid_json", "the planner must return a JSON object")
@@ -76,10 +92,15 @@ def validate_candidates(raw, limits):
             # the safe answer is to drop that one and say why, not to refuse
             # the whole answer. Dropped candidates can never be selected, so
             # nothing unvalidated reaches a worker.
+            # Everything here comes off the planner's JSON *having failed
+            # validation*, so it is the one place unchecked model text enters a
+            # structure that gets printed and stored. Render it rather than
+            # echo it: an id of "x\x1b[2K\rrejected other-id: fine" would
+            # otherwise erase the rejection line and forge its own.
             unusable.append({
-                "id": candidate.get("id") if isinstance(candidate, dict) else None,
+                "id": safe_text(candidate.get("id")) if isinstance(candidate, dict) else None,
                 "reason": bad.code,
-                "detail": bad.message,
+                "detail": safe_text(bad.message),
             })
     return out, unusable
 

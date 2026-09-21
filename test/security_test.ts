@@ -331,3 +331,93 @@ Deno.test("ROLES: a model reference from a roles file cannot carry shell", () =>
   assertEquals(existsSync(pwn), false, "the model reference must not reach a shell")
   assertEquals(r.code, 2)
 })
+
+// ======================================== finding 6: terminal-escape injection
+//
+// This finding had a test; it was deleted when per-candidate reporting landed,
+// because the whole-plan refusal it asserted became a per-candidate rejection.
+// The guard in plan.py survived that change. The *reporting path* added by it
+// did not have one: an unusable candidate is echoed by id, and that id is read
+// straight off the planner's JSON inside the except handler, before anything
+// has validated it. So the escape reaches the terminal through the very
+// mechanism that was added to be more transparent about bad candidates.
+
+const ESC = String.fromCharCode(27)
+
+/** A planner returning one candidate, hostile in exactly one field. */
+function hostileCandidate(over: Record<string, unknown>): string {
+  const c = {
+    id: "looks-fine",
+    source_ref: "SPEC.md#x",
+    title: "Harmless",
+    task: "x".repeat(300),
+    scope: ["src/**"],
+    acceptance: [{ id: "A1", criterion: "ok" }],
+    depends_on: [],
+    benefit: 3,
+    clarity: 2,
+    boundedness: 2,
+    risk: "normal",
+    rationale: "r",
+    ...over,
+  }
+  return stubPlanner(`cat <<'J'\n${JSON.stringify({ candidates: [c] })}\nJ`)
+}
+
+Deno.test("SEC-6: control characters in a candidate's text are refused", () => {
+  const dir = specRepo()
+  const r = run(dir, ["auto", "plan", "--from", "SPEC.md", "--json"], {
+    GATOR_PLANNER_CMD: hostileCandidate({ title: `Harmless${ESC}[2K\rFORGED` }),
+    GATOR_VERIFY: "true",
+    GATOR_PLAN_COOLDOWN: "0",
+  })
+  assertStringIncludes(r.out, "candidate_control_characters")
+  assertEquals(r.out.includes(ESC), false, "no escape reaches the terminal")
+})
+
+Deno.test("SEC-6: control characters in an acceptance criterion are refused", () => {
+  const dir = specRepo()
+  const r = run(dir, ["auto", "plan", "--from", "SPEC.md", "--json"], {
+    GATOR_PLANNER_CMD: hostileCandidate({
+      acceptance: [{ id: "A1", criterion: `ok${ESC}[2K\rFORGED` }],
+    }),
+    GATOR_VERIFY: "true",
+    GATOR_PLAN_COOLDOWN: "0",
+  })
+  assertStringIncludes(r.out, "candidate_control_characters")
+  assertEquals(r.out.includes(ESC), false, "no escape reaches the terminal")
+})
+
+Deno.test("SEC-6: a rejected candidate's own id cannot carry an escape to the terminal", () => {
+  // The id is what the rejection line prints. It is read from the planner's
+  // JSON in the except handler, so it has been through no validation at all.
+  const dir = specRepo()
+  const r = run(dir, ["auto", "plan", "--from", "SPEC.md"], {
+    GATOR_PLANNER_CMD: hostileCandidate({ id: `bad${ESC}[2K\rrejected fake-id: looks fine` }),
+    GATOR_VERIFY: "true",
+    GATOR_PLAN_COOLDOWN: "0",
+  })
+  assertEquals(
+    r.out.includes(ESC),
+    false,
+    `an escape reached the terminal through the rejection line: ${JSON.stringify(r.out)}`,
+  )
+})
+
+Deno.test("SEC-6: no control character survives into the stored manifest", () => {
+  // The manifest is read back later and rendered by other commands, so an
+  // escape stored on disk is a delayed version of the same attack.
+  const dir = specRepo()
+  run(dir, ["auto", "plan", "--from", "SPEC.md", "--json"], {
+    GATOR_PLANNER_CMD: hostileCandidate({ id: `bad${ESC}[2K\rforged` }),
+    GATOR_VERIFY: "true",
+    GATOR_PLAN_COOLDOWN: "0",
+  })
+  const plans = join(dir, ".gator", "auto", "plans")
+  if (!existsSync(plans)) return // refused before a manifest was written: fine
+  for (const f of Deno.readDirSync(plans)) {
+    const body = Deno.readTextFileSync(join(plans, f.name))
+    // JSON escaping renders ESC as \u001b, so the raw byte must be absent.
+    assertEquals(body.includes(ESC), false, `raw escape stored in ${f.name}`)
+  }
+})
