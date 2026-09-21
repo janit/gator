@@ -151,6 +151,13 @@ Be clear about what this does and does not do.
 branch, it is verified there, and nothing reaches your branch unless the
 verifier passed. A bad unit costs a merge that never happened.
 
+**Scope is enforced, not requested.** The whole base-to-result diff is compared
+against `--scope` before anything merges — every rename endpoint, deletion,
+mode change and symlink, because each is a way to move work out of the
+declared area. A unit that strayed is held with its worktree and the offending
+paths named. `--scope "**"` declines scoping, which is yours to choose; the
+planner cannot choose it.
+
 **It is not a sandbox.** The worker and the planner are subprocesses running
 with your permissions. Nothing here prevents writes outside the worktree,
 network access, reading credentials or manipulating git. The prompt asks the

@@ -171,3 +171,28 @@ Deno.test("EVIDENCE: rejecting everything reads differently from finding nothing
   assertStringIncludes(r.out, "Considered 1")
   assertStringIncludes(r.out, "none eligible")
 })
+
+// ------------------------------------- only selectable items need a full task
+
+Deno.test("EVIDENCE: the prompt does not tie task length to the rating", () => {
+  // Tried on 2026-09-20: "write the full task only for items you rate as
+  // selectable". It made rating something selectable *more work*, and the
+  // ratings moved — correct selections went 3 of 4 to 1 of 4 while latency
+  // did not improve. Never couple the effort a rating costs to the rating.
+  const dir = specRepo()
+  const d = mkdtempSync(join(tmpdir(), "gator-pl-"))
+  const p = join(d, "p.sh")
+  const promptFile = join(d, "prompt.txt")
+  writeFileSync(
+    p,
+    `#!/usr/bin/env bash\ncat > ${promptFile}\n${
+      emits(JSON.stringify({ candidates: [cand()] }))
+    }\n`,
+  )
+  chmodSync(p, 0o755)
+  plan(dir, `bash ${p}`)
+
+  const prompt = Deno.readTextFileSync(promptFile)
+  assertEquals(prompt.includes("only for items you rate as selectable"), false)
+  assertStringIncludes(prompt, "Do not pre-select")
+})

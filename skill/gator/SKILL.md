@@ -40,6 +40,10 @@ gator feed --title "<short name>" \
            --task "<the full instruction for the worker>"
 ```
 
+`--scope` is enforced: the whole diff is compared against it before anything
+merges, so name every area the work touches. `"**"` declines scoping
+altogether if that is what you mean.
+
 `--task @path/to/file` reads the instruction from a file, which is easier than
 quoting a long string. If `gator` is not on your `PATH`, run it as `./gator` from
 the repository.
@@ -125,6 +129,7 @@ Report the status plainly, including the bad ones:
 | `unverified` | committed on its branch but **the project does not build or test** — not merged, worktree kept |
 | `conflicted` | the merge was aborted; the branch is left for inspection |
 | `empty` | **it spat the chunk out — nothing was committed** — never describe this as done |
+| `out_of_scope` | **it changed files outside the scope you gave it** — not merged, worktree kept |
 | `failed` / `timeout` | the worker errored or ran out of its budget |
 | `no_candidate` | **`auto plan` found nothing eligible** — a success, and the honest answer |
 

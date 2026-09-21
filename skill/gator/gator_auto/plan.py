@@ -11,6 +11,7 @@ import os
 import re
 import tempfile
 
+from . import scope
 from .repo import MAX_CANDIDATES, Refusal
 
 # Exactly the keys a candidate may carry. The controller — not the planner —
@@ -28,43 +29,24 @@ CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 RISKS = frozenset({"normal", "review_required", "disallowed"})
 SCORE_RANGE = {"benefit": (0, 3), "clarity": (0, 2), "boundedness": (0, 2)}
 
-# Paths the planner may never name, whatever the pattern around them.
-FORBIDDEN_ROOTS = (".git", ".gator")
 
 
 def validate_scope(patterns):
-    """The one documented matcher: exact repo-relative paths and `<dir>/**`.
+    """The planner's view of the matcher: same grammar, no whole-repo escape.
 
-    Deliberately small. A matcher nobody can fully predict is a matcher that
-    cannot be enforced against a diff, which is what step 3 must do.
+    A human may type `**` and decline scoping; a model may not, so this is
+    `scope.check_pattern` with `allow_unscoped` left false.
     """
     if not isinstance(patterns, list) or not patterns:
         raise Refusal("candidate_bad_scope", "scope must be a non-empty list of patterns")
-
     out = []
     for pattern in patterns:
-        if not isinstance(pattern, str) or not pattern:
-            raise Refusal("candidate_bad_scope", f"scope entry must be a non-empty string: {pattern!r}")
-        if pattern.startswith("/") or ":" in pattern:
-            raise Refusal("candidate_bad_scope", f"scope must be repository-relative: {pattern}")
-        if pattern in ("**", "*", ".", "./", "**/*"):
-            raise Refusal("candidate_scope_root", "a whole-repository scope is not a scope")
-
-        body = pattern[:-3] if pattern.endswith("/**") else pattern
-        if not body or body.startswith("/"):
-            raise Refusal("candidate_bad_scope", f"scope names no directory: {pattern}")
-
-        parts = body.split("/")
-        if any(p in ("..", "") for p in parts):
-            raise Refusal("candidate_bad_scope", f"scope escapes the repository: {pattern}")
-        if parts[0] in FORBIDDEN_ROOTS:
-            raise Refusal("candidate_bad_scope", f"scope may not name {parts[0]}: {pattern}")
-        if "*" in body:
-            raise Refusal(
-                "candidate_bad_scope",
-                f"the only wildcard is a trailing /**: {pattern}",
-            )
-        out.append(pattern)
+        try:
+            out.append(scope.check_pattern(pattern))
+        except scope.ScopeError as bad:
+            code = ("candidate_scope_root" if "whole-repository" in str(bad)
+                    else "candidate_bad_scope")
+            raise Refusal(code, str(bad))
     return out
 
 

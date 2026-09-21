@@ -150,8 +150,11 @@ authority over budgets, launch commands, secrets or policy.
 Satisfied here: **1, 2, 3, 4, 5, 9, 16, 17**, and 6 and 14 for the parts that
 exist without execution.
 
+Also satisfied: **10** (scope enforced against the diff) — see
+`test/scope_test.ts`.
+
 Left for steps 3–4: **7** (concurrent reservations), **8** (crash and resume),
-**10** (scope enforced against the diff), **11** (worker-modified verification),
+**11** (worker-modified verification),
 **12** (integration guards), **13** (exact-candidate verification), **15**
 (budget persistence). `test/findings_test.ts` carries these as
 `CHARACTERIZATION` tests describing today's behaviour; each names the step that

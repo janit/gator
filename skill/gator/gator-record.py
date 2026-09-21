@@ -29,6 +29,8 @@ def outcome(rec):
         return "timeout"
     if w.get("rc", 0) != 0:
         return "failed"
+    if rec.get("scope", {}).get("violations"):
+        return "out_of_scope"
     if v.get("configured") and v.get("rc", 0) != 0:
         return "unverified"
     if not r.get("committed") or not r.get("ahead", 0):
@@ -90,7 +92,7 @@ def atomic_write(path, rec):
 
 def main(argv):
     if not argv:
-        print("usage: gator-record write|get|outcome|collect ...", file=sys.stderr)
+        print("usage: gator-record write|merge|get|outcome|collect ...", file=sys.stderr)
         return 2
     verb, args = argv[0], argv[1:]
 
@@ -106,6 +108,21 @@ def main(argv):
         for pair in pairs:
             key, _, value = pair.partition("=")
             assign(rec, key, coerce(key, value))
+        rec["outcome"] = outcome(rec)
+        atomic_write(path, rec)
+        return 0
+
+    if verb == "merge":
+        path, key, blob = args[0], args[1], args[2]
+        try:
+            rec = load(path)
+        except Exception:
+            rec = {}
+        rec["schema_version"] = SCHEMA_VERSION
+        try:
+            rec[key] = json.loads(blob)
+        except ValueError:
+            rec[key] = {"checked": False, "violations": []}
         rec["outcome"] = outcome(rec)
         atomic_write(path, rec)
         return 0

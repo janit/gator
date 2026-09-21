@@ -156,6 +156,18 @@ report_unit(){
   AHEAD=$(rget "$REC" result.ahead 0)
   ELAPSED=$(rget "$REC" worker.elapsed 0)
   echo "UNIT \"$SLUG\" → ${OUTCOME}  [${ELAPSED}s, ${AHEAD} commit(s), branch ${BRANCH}]"
+  if [ "$OUTCOME" = "out_of_scope" ]; then
+    echo "NOT merged: the unit changed files outside the scope it was given."
+    echo "declared scope: $(rget "$REC" scope_declared "")"
+    echo "outside it:"
+    python3 -c 'import json,sys
+try:
+    for p in json.load(open(sys.argv[1])).get("scope",{}).get("violations",[]): print("  "+p)
+except Exception: pass' "$REC"
+    echo "--- worktree kept at $DIR ---"
+    echo "Scope is the promise the unit was given. Widen it deliberately and re-feed,"
+    echo "or inspect the branch. Do not report this as done."
+  fi
   if [ "$OUTCOME" = "unverified" ]; then
     # The verifier the record holds, never one detected now: they can differ.
     VCMD=$(rget "$REC" verify.command "")
@@ -208,7 +220,7 @@ finalise(){
     git -C "$REPO" branch -D "$BRANCH" -q 2>/dev/null
   fi
 
-  if [ "$STATUS" = "unverified" ]; then
+  if [ "$STATUS" = "unverified" ] || [ "$STATUS" = "out_of_scope" ]; then
     report_unit "$SLUG"
   else
     echo "UNIT \"$SLUG\" → ${STATUS}${EXTRA}  [${ELAPSED}s, ${AHEAD} commit(s), branch ${BRANCH}]"
@@ -363,11 +375,11 @@ VCONF=false; [ -n "$VERIFY" ] && VCONF=true
 python3 "$HERE/gator-record.py" write "$RECORD" \
   "slug=$SLUG" "title=$TITLE" "branch=$BRANCH" \
   "base_sha=$BASE_SHA" "target_ref=$TARGET_REF" \
-  "scope=$SCOPE" "role=$ROLE" "model=$MODEL" \
+  "scope_declared=$SCOPE" "role=$ROLE" "model=$MODEL" \
   "verify.configured=$VCONF" "verify.command=$VERIFY" "verify.command_sha256=$VERIFY_SHA" \
   "worker.launch_error=true" "launched_at=$NOW"
 
-setsid nohup "$HERE/gator-unit" "$STORE" "$SLUG" "$DIR" "$CMD" "$UNIT_TIMEOUT" "$TITLE" "$VERIFY" "$RECORD" >/dev/null 2>&1 &
+setsid nohup "$HERE/gator-unit" "$STORE" "$SLUG" "$DIR" "$CMD" "$UNIT_TIMEOUT" "$TITLE" "$VERIFY" "$RECORD" "$SCOPE" >/dev/null 2>&1 &
 disown 2>/dev/null || true
 
 echo "FED \"$TITLE\" → role=$ROLE model=$MODEL branch=$BRANCH"

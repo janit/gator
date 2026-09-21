@@ -124,3 +124,29 @@ Deno.test("§9.2: an empty candidate list is a valid no-candidate result", () =>
   assertEquals(r.candidates, [])
   assertEquals(r.rejected, [])
 })
+
+// ------------- a short task on an item that was never selectable anyway
+
+Deno.test("the rubric reason outranks the task floor, so stubs stay informative", () => {
+  // Ineligible items are asked for a one-line task, because only the selected
+  // candidate is ever delegated. The floor must not then mask *why* the item
+  // was turned down: "benefit_below_threshold" is useful, "task_below_floor"
+  // on a chore nobody would delegate is noise.
+  const chore = select([cand({ id: "chore", benefit: 1, task: "Mechanical rename." })])
+  assertEquals(chore.rejected[0].reason, "benefit_below_threshold")
+
+  const vague = select([cand({ id: "vague", clarity: 1, task: "Unclear." })])
+  assertEquals(vague.rejected[0].reason, "needs_clarification")
+
+  const unbounded = select([cand({ id: "open", boundedness: 0, task: "Open-ended." })])
+  assertEquals(unbounded.rejected[0].reason, "not_bounded")
+})
+
+Deno.test("a stub task on an otherwise selectable item is still caught", () => {
+  // The other direction: rated as fully selectable but described in five
+  // words. The planner has contradicted itself and the floor is the check
+  // that notices.
+  const r = select([cand({ id: "contradiction", task: "Do the thing." })])
+  assertEquals(r.selected_id, null)
+  assertEquals(r.rejected[0].reason, "task_below_floor")
+})

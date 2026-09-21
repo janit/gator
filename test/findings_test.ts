@@ -45,13 +45,16 @@ Deno.test("CHARACTERIZATION §2.1: with no verifier a changed unit merges anyway
 })
 
 // ============================================================ §2 finding 2
-Deno.test("CHARACTERIZATION §2.2: a worker writing outside its scope is still merged", () => {
-  // Scope is advisory prose in the prompt; nothing compares it to the diff.
-  // Step 3 enforces scope against the actual base-to-result diff (§9.10).
+Deno.test("DESIRED §2.2: a worker writing outside its scope is not merged", () => {
+  // Was CHARACTERIZATION: scope was prose in the prompt and nothing compared
+  // it to the diff, so the out-of-scope file merged. Enforced as of the scope
+  // work — every rename endpoint, deletion, mode change and symlink counts.
+  // See test/scope_test.ts for the full matrix (§9.10).
   const dir = repo(`echo out > outside.txt`)
   feed(dir, "escapes scope", "src/**", { GATOR_VERIFY: "true" })
-  waitForUnit(dir, { GATOR_VERIFY: "true" })
-  assertEquals(existsSync(join(dir, "outside.txt")), true, "the out-of-scope file merged")
+  const w = waitForUnit(dir, { GATOR_VERIFY: "true" })
+  assertStringIncludes(w.out, "out_of_scope")
+  assertEquals(existsSync(join(dir, "outside.txt")), false, "the out-of-scope file was held")
 })
 
 // ============================================================ §2 finding 3
