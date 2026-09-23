@@ -58,9 +58,15 @@ def parse(argv):
     opts = {"repo": None, "store": None, "verb": None, "from": None, "plan": None,
             "json": False, "no_baseline": False, "config": []}
     rest = []
+    missing = None
     i = 0
     while i < len(argv):
         a = argv[i]
+        # A value flag at the end of argv has no value. Reported, not indexed
+        # past: a traceback exits 1, outside the documented 0/2/3/4 contract.
+        if a in ("--repo", "--store", "--config", "--from", "--plan") and i + 1 >= len(argv):
+            missing = a
+            break
         if a == "--repo":
             opts["repo"] = argv[i + 1]; i += 2
         elif a == "--store":
@@ -83,12 +89,15 @@ def parse(argv):
             else:
                 rest.append(a)
             i += 1
-    return opts, rest
+    return opts, rest, missing
 
 
 def main(argv):
-    opts, unknown = parse(argv)
+    opts, unknown, missing = parse(argv)
     as_json = opts["json"]
+
+    if missing:
+        return fail("missing_value", f"{missing} needs a value", as_json)
 
     if unknown:
         return fail("unknown_argument", f"unknown argument: {unknown[0]}", as_json)

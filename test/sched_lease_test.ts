@@ -356,3 +356,30 @@ leases.store_dir(${JSON.stringify(s)})
   assertEquals(r.code, 2, r.out)
   assertStringIncludes(r.out, "schema")
 })
+
+Deno.test("an unadopted lease survives the launch grace and is reaped after it", () => {
+  // pid 0 is a dispatch whose gator-unit has not adopted it yet. A crash in
+  // that window must not strand the backend forever, nor free it too early.
+  const r = py(`
+from gator_sched import leases
+now = 10_000.0
+doc = {"leases": {
+  "fresh": {"pid": 0, "started": now - leases.LAUNCH_GRACE + 5},
+  "stale": {"pid": 0, "started": now - leases.LAUNCH_GRACE - 5},
+}}
+print("dropped", leases.reap(doc, now=now))
+print("kept", sorted(doc["leases"]))
+`)
+  assertEquals(r.code, 0, r.out)
+  assertStringIncludes(r.out, "dropped ['stale']")
+  assertStringIncludes(r.out, "kept ['fresh']")
+})
+
+Deno.test("a reservation on a backend that does not honour one is not reported as reserved", () => {
+  // policy.candidates() ignores it there, so the state must not name it either.
+  const s = store()
+  const p = cfg("backend.local-4090.interactive_reservation = false\n")
+  assertEquals(sched(["reserve", "--store", s, "--backend", "local-4090", "--on"]).code, 0)
+  const doc = JSON.parse(sched(["status", "--store", s, "--config", p]).out)
+  assertEquals(doc.backends["local-4090"].state === "reserved", false, JSON.stringify(doc))
+})

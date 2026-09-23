@@ -50,9 +50,12 @@ def state_of(config, ident, doc, healthy=True):
         return "disabled"
     if not healthy:
         return "unhealthy"
-    if ident in set(doc.get("reservation", {})):
-        return "reserved"
     backend = config.backends.get(ident)
+    # A reservation binds only a backend configured to honour one, exactly as
+    # policy.candidates() decides. Reporting it anywhere else would name a
+    # reason that is not the reason, on a backend still taking work.
+    if ident in set(doc.get("reservation", {})) and backend and backend.interactive_reservation:
+        return "reserved"
     capacity = backend.capacity if backend else 0
     if active_counts(doc).get(ident, 0) >= capacity:
         return "busy"

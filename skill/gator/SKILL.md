@@ -36,13 +36,15 @@ work outlives this tool call.
 ```bash
 gator feed --title "<short name>" \
            --role heavy \
-           --scope "<files or globs it touches>" \
+           --scope "<files, or dir/** for a directory>" \
            --task "<the full instruction for the worker>"
 ```
 
 `--scope` is enforced: the whole diff is compared against it before anything
-merges, so name every area the work touches. `"**"` declines scoping
-altogether if that is what you mean.
+merges, so name every area the work touches. A pattern is a file path or a
+directory as `dir/**`; other wildcards such as `src/*.ts` are refused, because
+they cannot be enforced. `"**"` declines scoping altogether if that is what you
+mean.
 
 `--task @path/to/file` reads the instruction from a file, which is easier than
 quoting a long string. If `gator` is not on your `PATH`, run it as `./gator` from
@@ -133,6 +135,8 @@ Report the status plainly, including the bad ones:
 |---|---|
 | `merged` | swallowed: built and tested clean, and now on your branch |
 | `unverified` | committed on its branch but **the project does not build or test** — not merged, worktree kept |
+| `integration_failed` | **green on its own branch, red once merged with what has landed since** — not merged, worktree kept |
+| `ready (held)` | green, but your tree is dirty or a different branch is checked out; merges when that is put right |
 | `conflicted` | the merge was aborted; the branch is left for inspection |
 | `empty` | **it spat the chunk out — nothing was committed** — never describe this as done |
 | `out_of_scope` | **it changed files outside the scope you gave it** — not merged, worktree kept |

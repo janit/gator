@@ -240,3 +240,29 @@ Deno.test("get renders a recorded list as JSON for its shell caller", () => {
   rec(["write", path, "resource.eligible=local-5090"])
   assertEquals(rec(["get", path, "resource.eligible", "[]"]).out, '["local-5090"]')
 })
+
+Deno.test("a scope that could not be enforced fails closed as out_of_scope", () => {
+  assertEquals(
+    outcomeOf([
+      "worker.rc=0",
+      "result.committed=true",
+      "result.ahead=1",
+      "scope.unenforceable=src/*.ts",
+    ]),
+    "out_of_scope",
+  )
+})
+
+Deno.test("§2.7: green alone but red once integrated is integration_failed", () => {
+  assertEquals(
+    outcomeOf([
+      "worker.rc=0",
+      "result.committed=true",
+      "result.ahead=1",
+      "verify.configured=true",
+      "verify.rc=0",
+      "integration.rc=1",
+    ]),
+    "integration_failed",
+  )
+})

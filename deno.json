@@ -4,7 +4,7 @@
   "license": "MIT",
   "exports": "./scripts/install.ts",
   "tasks": {
-    "test": "deno test -A",
+    "test": "bash scripts/test.sh",
     "install": "deno run -A scripts/install.ts",
     "check": "deno check scripts/ test/ && deno fmt --check && deno lint"
   },

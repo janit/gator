@@ -2,7 +2,7 @@
 # gator — feed one chunk of work to a bigger model, which chews on it in its own
 # git worktree on its own branch. Verified there, and merged back only when green.
 #
-#   gator feed --title <t> --role <r> --scope <globs> --task <text|@file>
+#   gator feed --title <t> --role <r> --scope <paths|dir/**> --task <text|@file>
 #   gator status      # what the gator is chewing; finalise anything it has finished
 #   gator wait        # block until it has swallowed everything, then finalise
 #
@@ -33,6 +33,16 @@ STORE="$REPO/.gator"; mkdir -p "$STORE/worktrees"
 chmod 700 "$STORE" 2>/dev/null || true
 STATE="$STORE/state.json"
 [ -f "$STATE" ] || echo '{"units":0,"last":0,"hashes":[]}' > "$STATE"
+
+# One lock per repository serialises everything that reads and then writes
+# shared state: the budget and dedup in state.json, the queue, and the merges
+# into the caller's branch. Without it two callers polling at once could merge
+# over each other, or dispatch one queued unit twice. It lives on fd 9, which
+# every long-lived child — a worker, a verifier — is started with closed, so a
+# detached unit never holds it.
+# Not named *.lock: that glob is the set of running units, which `wait` polls.
+repo_lock(){ exec 9>"$STORE/repo.mutex" && flock 9; }
+repo_unlock(){ flock -u 9 2>/dev/null; exec 9>&-; return 0; }
 
 # Exclude our store locally. Not through .gitignore: writing a file into the
 # user's repo would later block merging a branch that adds its own .gitignore.
@@ -200,7 +210,7 @@ launch_unit(){
     "resource.endpoint=$endpoint" "resource.eligible=$eligible" \
     "resource.dispatch_reason=$reason" "resource.queue_ms=$qms"
   touch "$STORE/$slug.lock"
-  setsid nohup "$HERE/gator-unit" "$STORE" "$slug" "$dir" "$cmd" "$UNIT_TIMEOUT" "$title" "$verify" "$rec" "$scope" >/dev/null 2>&1 &
+  setsid nohup "$HERE/gator-unit" "$STORE" "$slug" "$dir" "$cmd" "$UNIT_TIMEOUT" "$title" "$verify" "$rec" "$scope" >/dev/null 2>&1 9>&- &
   disown 2>/dev/null || true
 }
 
@@ -235,12 +245,19 @@ drain_queue(){
       fi
       continue
     fi
-    launch_unit "$slug" "$(qget "$q" dir "")" "$(qget "$q" cmd "")" \
+    # The marker goes before the spawn, not after. Interrupted in between, the
+    # unit is stranded where status shows it, rather than launched a second
+    # time into the same worktree once its lease frees. An ambiguous launch is
+    # never replayed.
+    local qdir qcmd qverify qat qscope
+    qdir=$(qget "$q" dir ""); qcmd=$(qget "$q" cmd ""); qverify=$(qget "$q" verify "")
+    qat=$(qget "$q" queued_at 0); qscope=$(qget "$q" scope "")
+    rm -f "$q"
+    launch_unit "$slug" "$qdir" "$qcmd" \
       "$(sched_field "$out" backend)" "$(sched_field "$out" endpoint)" \
       "$(sched_field "$out" resource)" "$(sched_field "$out" eligible)" \
       "$(sched_field "$out" reason)" "$STORE/$slug.record.json" \
-      "$title" "$(qget "$q" verify "")" "$(qget "$q" queued_at 0)" "$(qget "$q" scope "")"
-    rm -f "$q"
+      "$title" "$qverify" "$qat" "$qscope"
     echo "DISPATCHED \"$title\" → backend=$(sched_field "$out" backend)"
   done
   return 0
@@ -299,6 +316,8 @@ report_unit(){
   if [ "$OUTCOME" = "out_of_scope" ]; then
     echo "NOT merged: the unit changed files outside the scope it was given."
     echo "declared scope: $(rget "$REC" scope_declared "")"
+    local UNENF; UNENF=$(rget "$REC" scope.unenforceable "")
+    [ -n "$UNENF" ] && echo "scope could not be enforced: $UNENF is not a pattern the checker accepts"
     echo "outside it:"
     python3 -c 'import json,sys
 try:
@@ -321,6 +340,54 @@ except Exception: pass' "$REC"
   return 0
 }
 
+# Build the merge in a worktree of its own, run the unit's recorded verifier on
+# that exact tree, and fast-forward the target to it only when it is green. The
+# caller's tree is never where a red merge is discovered. Sets STATUS to merged,
+# conflicted, integration_failed, or held when the target moved underneath.
+integrate_candidate(){
+  local slug="$1" branch="$2" rec="$3" target="$4" cand head sha vrc
+  cand="$STORE/candidates/$slug"
+  git -C "$REPO" worktree remove --force "$cand" 2>/dev/null; rm -rf "$cand"
+  git -C "$REPO" worktree prune 2>/dev/null
+  mkdir -p "$STORE/candidates"
+  head=$(git -C "$REPO" rev-parse HEAD)
+  if ! git -C "$REPO" worktree add -q --detach "$cand" "$head" 2>/dev/null; then
+    STATUS="held"
+    echo "UNIT \"$slug\" → ready (held: could not create a worktree to verify the merge in)"
+    return 0
+  fi
+  if ! git -C "$cand" merge --no-edit -q -m "Merge branch '$branch' into $target" "$branch" >/dev/null 2>&1; then
+    git -C "$cand" merge --abort 2>/dev/null
+    git -C "$REPO" worktree remove --force "$cand" 2>/dev/null
+    STATUS="conflicted"
+    return 0
+  fi
+  sha=$(git -C "$cand" rev-parse HEAD)
+  log "verifying the merge of \"$slug\" into $target before it lands..."
+  ( cd "$cand" && timeout "${GATOR_VERIFY_TIMEOUT:-900}" bash -c "$(rget "$rec" verify.command "")" ) \
+    > "$STORE/$slug.integration" 2>&1 9>&-
+  vrc=$?
+  chmod 600 "$STORE/$slug.integration" 2>/dev/null || true
+  git -C "$REPO" worktree remove --force "$cand" 2>/dev/null
+  python3 "$HERE/gator-record.py" write "$rec" \
+    "integration.rc=$vrc" "integration.base_sha=$head" "integration.candidate_sha=$sha"
+  if [ "$vrc" -ne 0 ]; then
+    STATUS="integration_failed"
+    return 0
+  fi
+  # Fast-forward only: if anything moved the target while the candidate was
+  # being verified, what was verified is no longer what would land.
+  if [ "$(git -C "$REPO" rev-parse HEAD)" != "$head" ] \
+    || [ -n "$(git -C "$REPO" status --porcelain -- . ':(exclude).gator')" ] \
+    || ! git -C "$REPO" merge --ff-only -q "$sha" 2>/dev/null; then
+    STATUS="held"
+    echo "UNIT \"$slug\" → ready (held: $target changed while the merge was being verified)"
+    echo "Run 'gator status' again to verify it against the new $target."
+    return 0
+  fi
+  STATUS="merged"
+}
+
 # Finalising is reporting plus the side effects: the merge, the cleanup and the
 # reported marker.
 finalise(){
@@ -336,6 +403,18 @@ finalise(){
   ELAPSED=$(rget "$REC" worker.elapsed 0)
 
   EXTRA=""
+  # The unit was fed against one branch, and it merges into that branch or not
+  # at all. Whatever happens to be checked out now is not its target (§2.4).
+  # Records from before target_ref existed carry none, and keep the old rule.
+  local TARGET NOW_REF
+  TARGET=$(rget "$REC" target_ref "")
+  NOW_REF=$(git -C "$REPO" symbolic-ref -q HEAD || echo "")
+  if [ "$STATUS" = "ready" ] && [ "${GATOR_AUTOMERGE:-1}" = "1" ] && [ -n "$TARGET" ] \
+    && [ "$NOW_REF" != "$TARGET" ]; then
+    echo "UNIT \"$SLUG\" → ready (held: it was fed from ${TARGET#refs/heads/}, and ${NOW_REF:+${NOW_REF#refs/heads/} is checked out now}${NOW_REF:-HEAD is detached now})  [${ELAPSED}s, ${AHEAD} commit(s), branch ${BRANCH}]"
+    echo "Check out ${TARGET#refs/heads/}, then run 'gator status' again to merge it."
+    return 0
+  fi
   # Hold the merge while the caller's tree is dirty, as the warning at delegation
   # time promised. Merging into work in progress is not ours to risk.
   if [ "$STATUS" = "ready" ] && [ -n "$(git -C "$REPO" status --porcelain -- . ':(exclude).gator')" ]; then
@@ -345,7 +424,19 @@ finalise(){
     echo "Commit or stash your changes, then run 'gator --status' again to merge it."
     return 0
   fi
-  if [ "$STATUS" = "ready" ] && [ "${GATOR_AUTOMERGE:-1}" = "1" ]; then
+  if [ "$STATUS" = "ready" ] && [ "${GATOR_AUTOMERGE:-1}" = "1" ] \
+    && ! git -C "$REPO" merge-base --is-ancestor HEAD "$BRANCH" 2>/dev/null \
+    && [ "$VRC" -eq 0 ] && [ -n "$(rget "$REC" verify.command "")" ]; then
+    # The target moved since the unit branched, so the merge would produce a
+    # tree nobody has tested. Two units green apart can be red together (§2.7).
+    integrate_candidate "$SLUG" "$BRANCH" "$REC" "${TARGET#refs/heads/}"
+    case "$STATUS" in
+      held) return 0 ;;
+      merged)
+        EXTRA=" ($AHEAD commit(s)), integration verified green"
+        git -C "$REPO" worktree remove --force "$DIR" 2>/dev/null ;;
+    esac
+  elif [ "$STATUS" = "ready" ] && [ "${GATOR_AUTOMERGE:-1}" = "1" ]; then
     if git -C "$REPO" merge --no-edit -q "$BRANCH" 2>/dev/null; then
       STATUS="merged"; EXTRA=" ($AHEAD commit(s))"
       [ "$VRC" -eq 0 ] && EXTRA="$EXTRA, verified green"
@@ -362,13 +453,40 @@ finalise(){
 
   if [ "$STATUS" = "unverified" ] || [ "$STATUS" = "out_of_scope" ]; then
     report_unit "$SLUG"
+  elif [ "$STATUS" = "integration_failed" ]; then
+    echo "UNIT \"$SLUG\" → integration_failed  [${ELAPSED}s, ${AHEAD} commit(s), branch ${BRANCH}]"
+    echo "NOT merged: the branch verified green on its own, but merged into the current"
+    echo "${TARGET#refs/heads/} it does not build or test clean."
+    echo "verify command: $(rget "$REC" verify.command "")"
+    echo "--- last 25 lines of its output ---"
+    tail -n 25 "$STORE/$SLUG.integration" 2>/dev/null
+    echo "--- worktree kept at $DIR ---"
+    echo "Delegate a fix unit against this branch, or inspect it yourself. Do not report this as done."
   else
     echo "UNIT \"$SLUG\" → ${STATUS}${EXTRA}  [${ELAPSED}s, ${AHEAD} commit(s), branch ${BRANCH}]"
     echo "  resource=$(rget "$REC" resource.class "") backend=$(rget "$REC" resource.backend "") queue_ms=$(rget "$REC" resource.queue_ms 0) dispatch_reason=$(rget "$REC" resource.dispatch_reason "")$(res_detail "$REC")"
     SUMMARY=$(tail -c 400 "$STORE/$SLUG.log" 2>/dev/null | tr '\n' ' ')
     echo "worker said: ${SUMMARY:- (no output)}"
   fi
+  # What finalising decided, which the record's own outcome cannot know: a
+  # ready unit may have merged, conflicted or been left for review.
+  python3 "$HERE/gator-record.py" write "$REC" "finalised=$STATUS" 2>/dev/null
   mv "$STORE/$SLUG.done" "$STORE/$SLUG.reported" 2>/dev/null
+}
+
+# A unit reported once but never merged is still unresolved work: its branch
+# and worktree are waiting on someone. Reporting it only the first time would
+# let a missed line hide it for good, so it stays listed, in one line, until
+# its branch is deleted or merged by hand.
+remind_unit(){
+  local slug="$1" rec="$STORE/$1.record.json" out
+  [ -f "$rec" ] || return 0
+  out=$(rget "$rec" finalised "")
+  [ -n "$out" ] || out=$(python3 "$HERE/gator-record.py" outcome "$rec")
+  git -C "$REPO" show-ref --verify --quiet "refs/heads/gator/$slug" || return 0
+  git -C "$REPO" merge-base --is-ancestor "gator/$slug" HEAD 2>/dev/null && return 0
+  echo "UNIT \"$slug\" → $out (reported earlier, not merged; branch gator/$slug kept)"
+  echo "  Resolve it, then clear it: git worktree remove --force .gator/worktrees/$slug; git branch -D gator/$slug"
 }
 
 units(){ ls -1 "$STORE"/*.prompt 2>/dev/null | sed 's|.*/||;s|\.prompt$||'; }
@@ -432,12 +550,15 @@ done
 # The queue is drained wherever we are already doing something: gator has no
 # resident scheduler, so these are the moments a waiting unit gets its chance.
 if [ "$MODE" = "drain" ]; then
+  repo_lock
   drain_queue
   exit 0
 fi
 
 if [ "$MODE" = "status" ] || [ "$MODE" = "wait" ]; then
+  repo_lock
   drain_queue
+  repo_unlock
   U=$(units)
   if [ -z "$U" ]; then
     [ "$JSON" = "1" ] && { python3 "$HERE/gator-record.py" collect "$STORE"; exit 0; }
@@ -456,16 +577,20 @@ if [ "$MODE" = "status" ] || [ "$MODE" = "wait" ]; then
     python3 "$HERE/gator-record.py" collect "$STORE"
     exit 0
   fi
+  repo_lock
   for s in $U; do
     if [ "$NO_MERGE" = "1" ]; then report_unit "$s"
-    else [ -f "$STORE/$s.reported" ] || finalise "$s"; fi
+    elif [ -f "$STORE/$s.reported" ]; then remind_unit "$s"
+    else finalise "$s"; fi
   done
   exit 0
 fi
 
 case "$TASK" in @*) f="${TASK#@}"; [ -f "$f" ] || die "task file not found: $f"; TASK=$(cat "$f");; esac
 [ -n "$TITLE" ] || die "a chunk needs --title"
-[ -n "$SCOPE" ] || die "\"$TITLE\" names no scope. State which files or globs the chunk touches."
+[ -n "$SCOPE" ] || die "\"$TITLE\" names no scope. State which files, or dir/** directories, the chunk touches."
+SCOPE_ERR=$(python3 "$HERE/gator-scope.py" --check "$SCOPE" 2>&1) \
+  || die "\"$TITLE\" has a scope that cannot be enforced: $SCOPE_ERR"
 LEN=${#TASK}
 [ "$LEN" -ge "$MIN_TASK_CHARS" ] || die "\"$TITLE\" is too small a chunk to be worth feeding ($LEN < $MIN_TASK_CHARS chars). Do it yourself."
 MODEL=$(resolve_role "$ROLE")
@@ -473,6 +598,9 @@ MODEL=$(resolve_role "$ROLE")
          \"$ROLE=<provider>/<model>\" to $ROLES_FILE"
 check_model "$MODEL" "$ROLE"
 
+# Held from the budget and dedup checks until this process exits, so the state
+# written below is the state that was checked.
+repo_lock
 HASH=$(printf '%s' "$TASK" | tr '[:upper:]' '[:lower:]' | sha256sum | cut -c1-16)
 UNITS=$(jget "$STATE" units 0); LAST=$(jget "$STATE" last 0)
 python3 -c 'import json,sys

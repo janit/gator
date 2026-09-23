@@ -433,3 +433,10 @@ Deno.test("§9.6: --no-baseline marks the plan unchecked rather than green", () 
   assertEquals(plan.baseline.checked, false)
   assertEquals(plan.baseline.rc, null)
 })
+
+Deno.test("a value flag with no value is refused, not a traceback", () => {
+  const r = run(specRepo(), ["auto", "plan", "--from"])
+  assertEquals(r.code, 2, r.out)
+  assertStringIncludes(r.out, "--from needs a value  [missing_value]")
+  assertEquals(r.out.includes("Traceback"), false, r.out)
+})

@@ -198,6 +198,10 @@ def baseline_check(root, command, timeout=900):
     import shutil
     import tempfile as _tempfile
 
+    # A run killed mid-verifier never reaches the `finally` below, and leaves
+    # a worktree registered against a temp directory that is later cleaned
+    # away. Pruning first keeps those from accumulating in .git/worktrees.
+    git(root, "worktree", "prune", check=False)
     scratch = _tempfile.mkdtemp(prefix="gator-baseline-")
     work = os.path.join(scratch, "tree")
     try:

@@ -120,9 +120,11 @@ Run it as \`gator\` from any git repository.
 Roles live in a file rather than the environment, so no model id is in the code
 and no shell profile has to be edited:
 
-  ~/.config/gator/roles        heavy = fleet/DeepSeek-V4-Flash
+  ~/.config/gator/roles        heavy = yeti/DeepSeek-V4-Flash
   .gator/roles                 per-repository override
 
 The same file carries worker_cmd, where %PROVIDER% and %MODEL% are substituted
-from the role's model reference.
+from the role's model reference. Keep API keys out of it: the command appears in
+process arguments, which other local users can read. Use the worker's own
+environment variable or config file for the key.
 `)

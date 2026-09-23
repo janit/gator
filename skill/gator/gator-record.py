@@ -29,12 +29,16 @@ def outcome(rec):
         return "timeout"
     if w.get("rc", 0) != 0:
         return "failed"
-    if rec.get("scope", {}).get("violations"):
+    # A scope that could not be enforced has not been kept; fail closed.
+    if rec.get("scope", {}).get("violations") or rec.get("scope", {}).get("unenforceable"):
         return "out_of_scope"
     if v.get("configured") and v.get("rc", 0) != 0:
         return "unverified"
     if not r.get("committed") or not r.get("ahead", 0):
         return "empty"
+    # Green on its own branch, red once merged into the target as it is now.
+    if rec.get("integration", {}).get("rc", 0) != 0:
+        return "integration_failed"
     return "ready"
 
 
@@ -55,6 +59,7 @@ INT_KEYS = frozenset({
     "launched_at",
     "baseline.rc",
     "resource.queue_ms",
+    "integration.rc",
 })
 # The eligible set crosses the shell boundary as a comma string because argv
 # carries strings. It is a list in the record, so nothing downstream has to

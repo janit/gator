@@ -19,8 +19,8 @@ Roles live in a file, so no model id is in the code and no shell profile has to 
 edited — `~/.config/gator/roles`, or `.gator/roles` to override per repository:
 
 ```ini
-heavy  = fleet/DeepSeek-V4-Flash
-review = fleet/Qwen3.8-Flash-Next
+heavy  = yeti/DeepSeek-V4-Flash
+review = fleet/Qwen3.8-27B
 
 # how a worker is launched; %PROVIDER% and %MODEL% come from the role
 worker_cmd = opencode run --standalone --auto --model %PROVIDER%/%MODEL% "$(cat)"
@@ -70,6 +70,11 @@ after fixing two characters** in an import path — 209 points lost because noth
 ran the build. A unit that does not build reports `unverified`, keeps its
 worktree, and hands back the build output.
 
+When the target branch has moved since a unit branched off it — another unit
+merged first, say — the merge is built in a scratch worktree and verified there,
+and the branch is fast-forwarded to that exact tree only when it is green. Two
+units that each pass alone can fail together; that reports `integration_failed`.
+
 The command is detected from the project (`deno task build && deno task test`,
 `npm test`, `cargo test`), or set in `.gator/verify` or `GATOR_VERIFY`.
 
@@ -79,7 +84,8 @@ The command is detected from the project (`deno task build && deno task test`,
 |---|---|
 | `merged` | swallowed: built and tested clean, now on your branch |
 | `unverified` | committed on its branch, but does not build — not merged, worktree kept |
-| `ready (held)` | green, but your tree is dirty; merges when it is clean |
+| `integration_failed` | green alone, red merged into the target as it is now — not merged, worktree kept |
+| `ready (held)` | green, but your tree is dirty or another branch is checked out; merges when put right |
 | `conflicted` | the merge was aborted; branch left for inspection |
 | `empty` | **it spat the chunk out, nothing committed** — never report this as done |
 | `failed` / `timeout` | the worker errored or spent its budget |
@@ -104,6 +110,8 @@ reason.
 | `GATOR_MAX_PER_SESSION` | `8` | total feedings per session |
 | `GATOR_COOLDOWN` | `90` | digestion time between feedings, seconds |
 | `GATOR_UNIT_TIMEOUT` | `2400` | per-chunk budget, seconds |
+| `GATOR_VERIFY_TIMEOUT` | `900` | how long one verifier run may take, in the unit's worktree or on the merge, seconds |
+| `GATOR_POLL` | `10` | how often `gator wait` checks for finished chunks, seconds |
 | `GATOR_VERIFY` | detected | the command that decides "green" |
 | `GATOR_AUTOMERGE` | `1` | set `0` to leave green chunks on their branch |
 | `GATOR_WORKER_CMD` | `pi …` | how to invoke a worker; `%PROVIDER%`/`%MODEL%` substituted |
@@ -231,7 +239,7 @@ full verifier run. `GATOR_PLAN_COOLDOWN`, `GATOR_MAX_PLANS`.
 ## Supported platform
 
 Linux, with the GNU utilities this already assumes — `timeout`, `setsid`,
-`readlink -f`, `sha256sum` — plus Git and Python 3. Deno builds and tests it but
+`flock`, `readlink -f`, `sha256sum` — plus Git and Python 3. Deno builds and tests it but
 is not needed to run it. Other platforms may work and have not been tested.
 
 ## Security model
@@ -246,7 +254,9 @@ verifier passed. A bad unit costs a merge that never happened.
 against `--scope` before anything merges — every rename endpoint, deletion,
 mode change and symlink, because each is a way to move work out of the
 declared area. A unit that strayed is held with its worktree and the offending
-paths named. `--scope "**"` declines scoping, which is yours to choose; the
+paths named. A pattern is a file path or a directory as `dir/**`; anything
+else, `src/*.ts` say, is refused at feed time rather than left unenforced.
+`--scope "**"` declines scoping, which is yours to choose; the
 planner cannot choose it.
 
 **It is not a sandbox.** The worker and the planner are subprocesses running
@@ -275,6 +285,14 @@ GATOR_TRUST_REPO_CONFIG=1 gator ...   # this repository's .gator/ is mine
 Without it, a repository-supplied `roles`, `verify` or `resources` is skipped
 with a note on stderr, and `auto plan` refuses for want of an approved verifier
 rather than running a stranger's shell. Set it only for repositories you wrote.
+
+**Keep keys out of `worker_cmd`.** The command is passed as an argument to
+the processes that run it, and on Linux any local user can read another's
+process arguments with `ps`. A key written into the command — `--api-key sk-…`
+— is visible for as long as a unit runs. Put it in the environment the worker
+reads it from, or in the worker's own config file, and leave the command
+naming only the provider and model. The roles file is `0600` for the same
+reason, but that protects the file, not the running process.
 
 Task text has no authority over any of this either. A chunk that asks to be
 scheduled somewhere is asking the model that reads it, not the scheduler, which

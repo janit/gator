@@ -109,23 +109,27 @@ check; the gates above are the only real bar.
 
 ## Reason codes
 
-Preconditions: `not_a_repo`, `bare_repo`, `detached_head`, `unsupported_worktree`,
+Preconditions: `git_failed` (including outside a repository), `bare_repo`, `detached_head`, `unsupported_worktree`,
 `source_missing`, `source_not_committed`, `source_outside_repo`,
 `source_too_large`, `source_symlink_escape`, `no_source`.
 
-Planner: `planner_tools_enabled`, `planner_timeout`, `planner_failed`,
+Planner: `planner_role_not_configured`, `planner_tools_enabled`, `planner_timeout`, `planner_failed`,
 `planner_invalid_json`, `planner_input_too_large`, `planner_output_too_large`.
 
 Validation: `candidate_unknown_field`, `candidate_missing_field`,
 `candidate_bad_id`, `candidate_duplicate_id`, `candidate_bad_score`,
 `candidate_bad_risk`, `candidate_bad_scope`, `candidate_scope_root`,
-`too_many_candidates`, `unknown_dependency`.
+`too_many_candidates`. A dependency on an id that does not exist is not a
+validation failure; it is reported per candidate as `unresolved_dependency`.
 
 Verification: `verifier_not_approved`, `baseline_red`.
 
 Rate limiting: `plan_cooldown`, `plan_budget_spent`, `plan_in_flight`.
 
 Hostile input: `candidate_control_characters`, `planner_output_too_large`.
+
+Command line: `unknown_argument`, `missing_value`, `unknown_verb`,
+`verb_unavailable`, `no_plan`.
 
 Bindings: `plan_not_found`, `stale_plan_hash`, `stale_source`, `stale_policy`,
 `stale_target`, `wrong_repository`.

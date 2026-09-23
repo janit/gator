@@ -69,8 +69,8 @@ Deno.test("CHARACTERIZATION §2.3: partial work that admits it is incomplete sti
 
 // ============================================================ §2 finding 4
 Deno.test("DESIRED §2.4: the record pins the target ref captured at feed time", () => {
-  // The merge itself is not yet bound to it — step 3 enforces that (§9.12) —
-  // but the intended target is now recorded rather than inferred at finalise.
+  // The intended target is recorded rather than inferred at finalise, and the
+  // merge is bound to it — see the branch-switch test below (§9.12).
   const dir = repo(`echo work > out.txt`)
   feed(dir, "pins target", "**", { GATOR_VERIFY: "true" })
   run(dir, ["wait", "--no-merge"], { GATOR_VERIFY: "true" })
@@ -79,18 +79,22 @@ Deno.test("DESIRED §2.4: the record pins the target ref captured at feed time",
   assertEquals(r.base_sha.length, 40)
 })
 
-Deno.test("CHARACTERIZATION §2.4: finalising after a branch switch merges into the new branch", () => {
-  // Step 3 refuses as stale_target instead (§9.12).
+Deno.test("DESIRED §2.4: finalising after a branch switch holds the unit for its own target", () => {
+  // Was CHARACTERIZATION: the merge went into whatever was checked out at
+  // finalise time. The record's target_ref now binds it (§9.12).
   const dir = repo(`echo work > out.txt`)
   feed(dir, "switcheroo", "**", { GATOR_VERIFY: "true" })
   run(dir, ["wait", "--no-merge"], { GATOR_VERIFY: "true" })
   git(dir, "checkout", "-q", "-b", "elsewhere")
+  const held = run(dir, ["status"], { GATOR_VERIFY: "true" })
+  assertStringIncludes(held.out, "held: it was fed from main, and elsewhere is checked out now")
+  assertEquals(existsSync(join(dir, "out.txt")), false, "nothing merged into the wrong branch")
+
+  // Held, not spent: back on its own branch, the same unit merges.
+  git(dir, "checkout", "-q", "main")
   const w = run(dir, ["status"], { GATOR_VERIFY: "true" })
   assertStringIncludes(w.out, "merged")
-  const branch = new Deno.Command("git", { args: ["branch", "--show-current"], cwd: dir })
-    .outputSync()
-  assertEquals(new TextDecoder().decode(branch.stdout).trim(), "elsewhere")
-  assertEquals(existsSync(join(dir, "out.txt")), true, "merged into the branch checked out now")
+  assertEquals(existsSync(join(dir, "out.txt")), true, "merged into the branch it was fed from")
 })
 
 // ============================================================ §2 finding 5
@@ -122,10 +126,10 @@ Deno.test("DESIRED §2.6: a failing verifier leaves the unit unmerged with its w
 })
 
 // ============================================================ §2 finding 7
-Deno.test("CHARACTERIZATION §2.7: two units green apart merge into a red combined tree", () => {
-  // The reproduced disjoint-file conflict. Each unit passes the verifier in
-  // its own worktree; the merged tree fails the same verifier. Step 4 verifies
-  // the exact integration candidate instead (§9.13).
+Deno.test("DESIRED §2.7: two units green apart do not merge into a red combined tree", () => {
+  // Was CHARACTERIZATION: each unit passed the verifier in its own worktree
+  // and the merged tree failed the same verifier. The integration candidate is
+  // now verified before the target moves (§9.13).
   const V = "test ! -f a.txt || test ! -f b.txt"
   // One stub, two branches: the file it writes is named after the branch, so a
   // single worker command serves both units.
@@ -137,13 +141,27 @@ Deno.test("CHARACTERIZATION §2.7: two units green apart merge into a red combin
   // would — correctly — fail there.
   feed(dir, "unit a", "a.txt", { GATOR_VERIFY: V })
   feed(dir, "unit b", "b.txt", { GATOR_VERIFY: V })
-  waitForUnit(dir, { GATOR_VERIFY: V })
+  const w = waitForUnit(dir, { GATOR_VERIFY: V })
 
-  assertEquals(
-    existsSync(join(dir, "a.txt")) && existsSync(join(dir, "b.txt")),
-    true,
-    "both merged",
-  )
+  assertStringIncludes(w.out, "integration_failed")
+  assertEquals(existsSync(join(dir, "a.txt")), true, "the first unit merged")
+  assertEquals(existsSync(join(dir, "b.txt")), false, "the second was held back")
   const combined = new Deno.Command("bash", { args: ["-c", V], cwd: dir }).outputSync()
-  assertEquals(combined.success, false, "the combined tree fails the verifier both units passed")
+  assertEquals(combined.success, true, "the target still passes its verifier")
+  const r = JSON.parse(readFileSync(join(dir, ".gator", "unit-b.record.json"), "utf8"))
+  assertEquals(r.outcome, "integration_failed")
+  assertEquals(existsSync(join(dir, ".gator", "worktrees", "unit-b")), true, "worktree kept")
+})
+
+Deno.test("DESIRED §2.7: a unit whose target moved merges once the combined tree is green", () => {
+  const V = "test -f base.txt"
+  const dir = repo(`n=$(git rev-parse --abbrev-ref HEAD); echo x > "\${n##*-}.txt"`)
+  feed(dir, "unit a", "a.txt", { GATOR_VERIFY: V })
+  feed(dir, "unit b", "b.txt", { GATOR_VERIFY: V })
+  const w = waitForUnit(dir, { GATOR_VERIFY: V })
+  assertStringIncludes(w.out, "integration verified green")
+  assertEquals(existsSync(join(dir, "a.txt")) && existsSync(join(dir, "b.txt")), true)
+  const r = JSON.parse(readFileSync(join(dir, ".gator", "unit-b.record.json"), "utf8"))
+  assertEquals(r.integration.rc, 0)
+  assertEquals(r.outcome, "ready")
 })

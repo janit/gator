@@ -2,6 +2,7 @@
 """gator-scope — compare a unit's whole diff against its declared scope.
 
   gator-scope.py <worktree> <base_sha> <scope>
+  gator-scope.py --check <scope>      exit 2, with the reason, if unenforceable
 
 Prints JSON: {"checked": bool, "changed": n, "violations": [paths]}.
 Exit 0 whether or not there are violations; the caller decides what they mean.
@@ -43,6 +44,22 @@ def changed_paths(worktree, base_sha):
 
 
 def main(argv):
+    # `--check <scope>`: is this scope one the grammar can enforce? Asked at
+    # feed time, so a pattern like `src/*.ts` is refused before anything is
+    # created, not discovered as unenforceable after the work is done.
+    if argv[:1] == ["--check"]:
+        patterns = scope.parse(argv[1] if len(argv) > 1 else "")
+        if not patterns:
+            print("scope names no files", file=sys.stderr)
+            return 2
+        for raw in patterns:
+            try:
+                scope.check_pattern(raw, allow_unscoped=True)
+            except scope.ScopeError as e:
+                print(f"{e}. Name files, or directories as dir/**; \"**\" declines scoping.",
+                      file=sys.stderr)
+                return 2
+        return 0
     if len(argv) < 3:
         print(json.dumps({"checked": False, "changed": 0, "violations": []}))
         return 0

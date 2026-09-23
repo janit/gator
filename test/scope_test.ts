@@ -106,3 +106,11 @@ Deno.test("SCOPE: scope outranks a failing verifier", () => {
   feed(dir, "strays and breaks", "src/**", { GATOR_VERIFY: "false" })
   assertStringIncludes(waitForUnit(dir, { GATOR_VERIFY: "false" }).out, "out_of_scope")
 })
+
+Deno.test("a scope the checker cannot enforce is refused at feed, before anything exists", () => {
+  const dir = repo(`echo work > out.txt`)
+  const r = feed(dir, "bad glob", "src/*.ts", { GATOR_VERIFY: "true" })
+  assertEquals(r.code, 2, r.out)
+  assertStringIncludes(r.out, "cannot be enforced")
+  assertEquals(existsSync(join(dir, ".gator", "worktrees", "bad-glob")), false, "no worktree")
+})
