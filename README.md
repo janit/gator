@@ -191,7 +191,7 @@ hard the task is. It is off unless the resources file names an endpoint:
 
 ```ini
 classifier.endpoint  = http://localhost:8086/v1
-classifier.model     = Qwen3.8-27B
+classifier.model     = granite-4.2-8b
 classifier.threshold = 0.75   # demote to standard only when at least this sure
 classifier.timeout   = 5
 ```

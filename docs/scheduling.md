@@ -105,7 +105,7 @@ no `role.<role>` mapping, no explicit `role.default` — gator can ask a model h
 hard the task is. It is off unless the resources file names an endpoint:
 
     classifier.endpoint  = http://localhost:8086/v1
-    classifier.model     = Qwen3.8-27B
+    classifier.model     = granite-4.2-8b
     classifier.threshold = 0.75   # demote only when at least this sure
     classifier.timeout   = 5
 

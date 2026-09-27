@@ -20,7 +20,12 @@ import urllib.error
 import urllib.request
 
 OPTIONS = {"H": "heavy", "S": "standard"}
-MAX_TASK_BYTES = 16 * 1024
+# Reading the prompt is the whole cost of a call, about linear in its length.
+# At 4 KB granite-4.2-8b answers in ~0.6 s on an A4000 and ~2.2 s on a Radeon
+# VII, inside the default 5 s timeout; at 16 KB the Radeon VII took ~8 s.
+# The head carries the title, scope and opening, and cutting the rest can only
+# hide complexity, which pushes the answer toward heavy.
+MAX_TASK_BYTES = 4 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 # Below this share of the returned probability mass, the model was not choosing
 # between the options at all — it wanted to begin a sentence, or to think.

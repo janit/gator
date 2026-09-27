@@ -3,7 +3,7 @@
 //   GATOR_CLASSIFIER_LIVE=1 deno test -A test/classifier_live_test.ts
 //
 // Optional: GATOR_CLASSIFIER_ENDPOINT (default http://localhost:8086/v1),
-// GATOR_CLASSIFIER_MODEL (default Qwen3.8-27B), GATOR_CLASSIFIER_THRESHOLD
+// GATOR_CLASSIFIER_MODEL (default granite-4.2-8b), GATOR_CLASSIFIER_THRESHOLD
 // (default 0.75).
 //
 // Only one kind of miss fails the test: a heavy task demoted to standard. That
@@ -21,7 +21,7 @@ Deno.test({
   ignore: !LIVE,
   fn() {
     const endpoint = Deno.env.get("GATOR_CLASSIFIER_ENDPOINT") ?? "http://localhost:8086/v1"
-    const model = Deno.env.get("GATOR_CLASSIFIER_MODEL") ?? "Qwen3.8-27B"
+    const model = Deno.env.get("GATOR_CLASSIFIER_MODEL") ?? "granite-4.2-8b"
     const threshold = Deno.env.get("GATOR_CLASSIFIER_THRESHOLD") ?? "0.75"
     const r = py(`
 import json

@@ -74,12 +74,12 @@ print(build_request("m", "<<TASK>>", "s", "SECRET-TASK")["messages"][0]["content
   assertEquals(r.out.split("SECRET-TASK").length - 1, 1, r.out)
 })
 
-Deno.test("task text is capped at 16 KB, keeping the head", () => {
+Deno.test("task text is capped at 4 KB, keeping the head", () => {
   const r = py(`
 from gator_sched.classify import build_request
-task = "a" * 16384 + "b" * 30000
+task = "a" * 4096 + "b" * 30000
 content = build_request("m", "t", "s", task)["messages"][0]["content"]
-print("a" * 16384 in content, "b" in content.split("--- BEGIN TASK")[1].split("--- END TASK")[0])
+print("a" * 4096 in content, "b" in content.split("--- BEGIN TASK")[1].split("--- END TASK")[0])
 `)
   assertEquals(r.code, 0, r.out)
   assertEquals(r.out.trim(), "True False")
