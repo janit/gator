@@ -1,7 +1,6 @@
 # gator 🐊
 
-**gator** is a **dele*gator*** skill — the name is the end of the word, and the
-animal earns it. A chat model hands it a chunk of substantial work; the gator
+**gator** is a **dele*gator*** skill — A chat model hands it a chunk of substantial work; the gator
 chews on it in an isolated git worktree on its own branch, and it is merged back
 only when it builds and tests clean.
 
