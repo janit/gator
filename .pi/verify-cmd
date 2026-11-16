@@ -1,0 +1,6 @@
+# The fast gate: types, format and lint, then the suite (stubbed worker, no model, no network; needs python3).
+# Two tests in test/sched_accept_test.ts are left out: "B7: with both idle, ..." and
+# "a queued unit is dispatched when the backend frees, ...". They race the stub worker,
+# which finishes before the second feed, and fail on main. The filter drops only names
+# starting "B7" or "a q" in that file. Put them back once they hold the first unit busy.
+deno task check && deno task test --ignore=test/sched_accept_test.ts && deno task test --filter '/^([^Ba]|B[^7]|a[^ ]|a [^q])/' test/sched_accept_test.ts
