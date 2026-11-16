@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Fetch the locked dependencies for a fresh clone.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+deno install --frozen
