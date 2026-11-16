@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Fetch the locked dependencies for a fresh clone.
-set -euo pipefail
-cd "$(dirname "$0")/.."
+# tehas runs this with sh from the worktree root, so it is POSIX sh.
+set -eu
 deno install --frozen
